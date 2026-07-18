@@ -1,0 +1,8 @@
+/build/
+/cmake-build-*/
+/.clangd-build/
+/.idea/
+/.vscode/
+/out/
+*.exe
+*.pdb

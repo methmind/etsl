@@ -1,0 +1,14 @@
+{
+  "lsp": {
+    "clangd": {
+      "binary": {
+        "path": "clangd",
+        "arguments": [
+          "--compile-commands-dir=.clangd-build",
+          "--experimental-modules-support",
+          "--header-insertion=never"
+        ]
+      }
+    }
+  }
+}
