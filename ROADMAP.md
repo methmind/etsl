@@ -84,6 +84,9 @@ cmake --build cmake-build-debug-clang        # рабочая сборка
   где `bytesWritten` эмитится из внутреннего буфера).
 - **Accept/Connect:** эмуляция не нужна — `AcceptEx`/`ConnectEx` нативно
   completion-based; их завершение мапится прямо в `onIncoming`/`onConnected`.
+- **Контракт attach (решение 19.07.2026):** сокет обязан быть неблокирующим
+  **до** `attach()` (FIONBIO — ответственность вызывающего, не реактора);
+  иначе MSG_PEEK-проба способна заблокировать поток цикла.
 - **Отвергнуто:** `WSAEventSelect` + `WSAWaitForMultipleEvents` (лимит 64 handle
   на ожидание, лишний поток); AFD poll в стиле wepoll (недокументированный API).
 
@@ -189,7 +192,7 @@ namespace `etsl`; классы с префиксом `C_`, методы `snake_c
 - **D1.** `#if defined(WINNT)` — `WINNT` определяет **только MinGW**-тулчейн
   (проверено препроцессором); MSVC его не определяет → под `cl` ветка уходит в
   `#error "Unsupported platform"`. Заменить на `_WIN32`; `LINUX` → `__linux__`.
-  Файлы: `src/event_loop/event_loop.cppm:17`, `src/socket/socket.cppm:5`,
+  Файлы: `src/reactor/event_loop.cppm:17`, `src/socket/socket.cppm:5`,
   `src/socket/socket_independent.cpp:5`. Заодно убрать stray `)` в строках
   `#error "...yet");` (`event_loop.cppm:21`, `socket_independent.cpp:9`).
 - **D2.** Двойное определение `etsl::socket_t`: `src/socket/socket.cppm`
@@ -202,9 +205,9 @@ namespace `etsl`; классы с префиксом `C_`, методы `snake_c
   для `SOCK_STREAM`). `SO_REUSEADDR` на Windows имеет иную семантику (разрешает
   захват адреса) — из фабрики убрать, для сервера в Этапе 2 использовать
   `SO_EXCLUSIVEADDRUSE`. `AF_INET` захардкожен — параметризовать в Этапе 2.
-- **D4.** `src/event_loop/impl/event_loop_iocp.cppm:18`: деструктор не делает
+- **D4.** `src/reactor/impl/event_loop_iocp.cppm:18`: деструктор не делает
   `CloseHandle(iocp_)` — утечка хэндла.
-- **D5.** `src/event_loop/impl/event_loop_iocp.cpp:33-35`: все failed completions
+- **D5.** `src/reactor/impl/event_loop_iocp.cpp:33-35`: все failed completions
   молча выбрасываются — ошибки (`WSAECONNRESET` и т.п.) не доходят до
   обработчика. Извлекать код через `WSAGetOverlappedResult`.
 - **D6.** `halt_` — обычный `bool`; `shutdown()` из другого потока = data race.
@@ -249,25 +252,31 @@ baseline размера зафиксирован.
 **Цель:** работающий IOCP-реактор с эмуляцией readiness по ADR-2/ADR-3.
 
 - [x] **1.1** `core/events.cppm`: `EventFlags`, `C_EventCallback` (сигнатуры из ADR-3). **(18.07.2026)**
-- [ ] **1.2** `reactor/reactor_trait.cppm`: concept — `initialize/run/shutdown/
+- [x] **1.2** `reactor/reactor_trait.cppm`: concept — `initialize/run/shutdown/
       attach/detach/post`; `static_assert` на бэкенде в `reactor.cppm`.
-      Переименовать `event_loop/` → `reactor/` (обновить CMakeLists, main.cpp).
-- [ ] **1.3** `reactor/impl/reactor_iocp.*`: registration struct
-      `{ SOCKET fd; uint8_t interest; C_EventCallback cb; WSAOVERLAPPED read_ov; state; }`
-      (живёт у владельца, ADR-4); `attach` = `CreateIoCompletionPort((HANDLE)fd,
-      iocp, (ULONG_PTR)&reg, 1)`; dispatch через `CONTAINING_RECORD`; ошибки —
-      `WSAGetOverlappedResult` → `EV_ERROR` + код (D5).
-- [ ] **1.4** Readiness-чтение по ADR-2: arm 0-byte `WSARecv` → completion →
-      `MSG_PEEK` проба → `EV_READ`/`EV_CLOSED`/re-arm; level-triggered перевзвод.
-- [ ] **1.5** `post()`/`shutdown()`: `PostQueuedCompletionStatus` с
-      зарезервированным completion key; `run()` исполняет posted tasks.
-- [ ] **1.6** Smoke-тест (`tests/smoke_loopback.cpp`): loopback TCP-пара —
+      Переименовать `event_loop/` → `reactor/` (обновить CMakeLists, main.cpp). **(19.07.2026)**
+- [x] **1.3** `reactor/impl/iocp/reactor_iocp.*`: `reg_iocp_s : WSAOVERLAPPED`
+      `{ bool is_closing; socket_t fd; socket_event_callback_t cb; }` (+ `static_assert`
+      на наследование; поле `interest` убрано — YAGNI) — живёт у владельца (ADR-4);
+      `attach` = `CreateIoCompletionPort((HANDLE)fd, iocp, iocp_code_e::IO, 0)`;
+      dispatch — `static_cast` от `WSAOVERLAPPED*` (наследование вместо
+      `CONTAINING_RECORD`); ошибки — `WSAGetOverlappedResult` → `EV_ERROR` + код (D5);
+      `attach/detach/post` возвращают `etl::expected<void, int32_t>`
+      (`[[nodiscard]]`, trait обновлён). **(19.07.2026)**
+- [x] **1.4** Readiness-чтение по ADR-2: arm 0-byte `WSARecv` → completion →
+      `MSG_PEEK` проба → `EV_READ`/`EV_CLOSED`/re-arm; level-triggered перевзвод. **(19.07.2026)**
+- [x] **1.5** `post()`/`shutdown()`: `PostQueuedCompletionStatus` с
+      зарезервированным completion key (`iocp_code_e`); `run()` исполняет posted
+      tasks (проверено кросс-поточным прогоном). **(19.07.2026)**
+- [x] **1.6** Smoke-тест (`src/test/smoke_loopback.cpp`): loopback TCP-пара —
       listener + connect, данные доставляются через `EV_READ`, закрытие —
-      через `EV_CLOSED`. Проверить отсутствие утечки хэндлов
-      (GetProcessHandleCount до/после).
+      через `EV_CLOSED`. Утечки хэндлов нет (GetProcessHandleCount до/после):
+      +2 хэндла один раз при первом `socket()` в процессе — ленивая подгрузка
+      провайдера Winsock (живут до `WSACleanup`), дельта по итерациям = 0. **(19.07.2026)**
 
-**DoD:** smoke-тест проходит; ошибка (RST пира) доставляется как `EV_ERROR`
-с корректным кодом; размер не вырос > baseline + согласованный порог.
+**DoD (19.07.2026):** smoke-тест проходит; RST пира доставляется как `EV_ERROR`
+с кодом `WSAECONNRESET` (10054) — проверено прогоном с `SO_LINGER{1,0}`;
+размер MinSize = 18 КБ (baseline 14 КБ; рост — в основном `<iostream>` в smoke-тесте).
 
 ### Этап 2 — tcp_socket / tcp_server
 

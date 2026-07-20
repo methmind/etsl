@@ -1,12 +1,29 @@
-import event_loop;
+#include <cassert>
+#include <windows.h>
+
+import reactor;
+import smoke_loopback;
+
+DWORD GetHandlesCount() noexcept
+{
+    DWORD count;
+    GetProcessHandleCount((HANDLE)-1, &count);
+    return count;
+}
 
 int main()
 {
-    etsl::C_EventLoop loop;
-    if (const auto res = loop.initialize(); !res) {
+    etsl::C_Reactor reactor;
+    if (const auto res = reactor.initialize(); !res) {
         return res.error();
     }
 
-    loop.run();
+    auto prev = GetHandlesCount();
+    smoke_loopback_test(reactor);
+    auto after = GetHandlesCount();
+
+    assert(prev == after && "Handle leaked!");
+
+    reactor.run();
     return 0;
 }

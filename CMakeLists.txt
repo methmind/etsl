@@ -6,24 +6,26 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_executable(etsl main.cpp
-        src/socket/socket_independent.cpp
-)
+add_executable(etsl main.cpp)
 
 target_sources(etsl
     PUBLIC FILE_SET CXX_MODULES FILES
-        src/event_loop/event_loop.cppm
-        src/event_loop/event_loop_trait.cppm
-        src/event_loop/impl/event_loop_iocp.cppm
+        src/reactor/reactor.cppm
+        src/reactor/reactor_trait.cppm
+        src/reactor/impl/iocp/reactor_iocp.cppm
+        src/reactor/impl/iocp/reactor_iocp_defs.cppm
         src/socket/socket_factory.cppm
         src/socket/socket_raii.cppm
         src/socket/socket_independent.cppm
         src/win/wsa_initializer.cppm
         src/core/socket_types.cppm
         src/core/events.cppm
+        src/test/smoke_loopback.cppm
     PRIVATE
-        src/event_loop/impl/event_loop_iocp.cpp
+        src/reactor/impl/iocp/reactor_iocp.cpp
         src/win/wsa_initializer.cpp
+        src/socket/socket_independent.cpp
+        src/test/smoke_loopback.cpp
 )
 
 target_include_directories(etsl PUBLIC

@@ -16,16 +16,17 @@ namespace etsl
         }
     }
 
-    etl::expected<bool, int32_t> C_WSAInitializer::initialize() noexcept
+    etl::expected<void, int32_t> C_WSAInitializer::initialize() noexcept
     {
         if (this->isInitialized_) {
-            return true;
+            return {};
         }
 
         if (const auto err = WSAStartup(MAKEWORD(2, 2), &this->wsaData_); err != NO_ERROR) {
             return etl::unexpected(err);
         }
 
-        return (this->isInitialized_ = true);
+        this->isInitialized_ = true;
+        return {};
     }
 }

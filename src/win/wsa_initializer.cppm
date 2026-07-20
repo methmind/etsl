@@ -15,7 +15,7 @@ export namespace etsl
         ~C_WSAInitializer() noexcept;
         C_WSAInitializer() noexcept : isInitialized_(false), wsaData_({}) {}
 
-        etl::expected<bool, int32_t> initialize() noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> initialize() noexcept;
     private:
         bool isInitialized_;
         WSADATA wsaData_;

@@ -2,15 +2,13 @@
 // Created by sexey on 18.07.2026.
 //
 module;
-#include <cstdint>
-
 #include "etl/delegate.h"
 
-export module core.events;
+export module socket.events;
 
 export namespace etsl
 {
-    enum EventFlags : uint8_t
+    enum class socket_event_flags_e : uint8_t
     {
         EV_READ   = 0x1,
         EV_WRITE  = 0x2,
@@ -18,5 +16,5 @@ export namespace etsl
         EV_ERROR  = 0x8,
     };
 
-    using C_EventCallback = etl::delegate<void(uint8_t events, int32_t error)>;
+    using socket_event_callback_t = etl::delegate<void(socket_event_flags_e event, int32_t error)>;
 }
