@@ -19,7 +19,7 @@ export namespace etsl
     using socket_t = SOCKET;
     constexpr socket_t INVALID_SOCKET_VALUE = INVALID_SOCKET;
 #elif defined(__linux__)
-    constexpr int32_t INVALID_SOCKET = -1;
+    constexpr INVALID_SOCKET = -1;
     using socket_t = int;
     constexpr socket_t INVALID_SOCKET_VALUE = INVALID_SOCKET;
 #endif

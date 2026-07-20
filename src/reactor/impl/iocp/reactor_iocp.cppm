@@ -12,6 +12,9 @@ import socket.types;
 import socket.events;
 import :defs;
 
+import timer;
+import timer.bucket;
+
 export namespace etsl
 {
     class C_ReactorIOCP
@@ -31,13 +34,18 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<void, int32_t> post(task_t* task) noexcept;
 
+        [[nodiscard]] etl::expected<void, int32_t> addTimer(C_Timer& timer) noexcept;
+
+        void removeTimer(C_Timer& timer) noexcept;
+
         void run() noexcept;
 
         void shutdown() noexcept;
     private:
-        [[nodiscard]] etl::expected<void, int32_t> rearmRead(reg_info_t* reg) noexcept;
+        [[nodiscard]] static etl::expected<void, int32_t> RearmRead(reg_info_t* reg) noexcept;
 
         etl::atomic<bool> halt_;
         HANDLE iocp_;
+        C_TimerBucket timerBucket_;
     };
 }

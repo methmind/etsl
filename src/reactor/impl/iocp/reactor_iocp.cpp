@@ -48,7 +48,7 @@ namespace etsl
             return etl::unexpected(static_cast<int32_t>(GetLastError()));
         }
 
-        return rearmRead(&reg);
+        return RearmRead(&reg);
     }
 
     etl::expected<void, int32_t> C_ReactorIOCP::detach(socket_t fd, reg_info_t& reg) noexcept
@@ -71,6 +71,22 @@ namespace etsl
         return {};
     }
 
+    etl::expected<void, int32_t> C_ReactorIOCP::addTimer(C_Timer& timer) noexcept
+    {
+        this->timerBucket_.add(timer);
+        if (!PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::ADD_TIMER), nullptr)) {
+            removeTimer(timer);
+            return etl::unexpected(static_cast<int32_t>(GetLastError()));
+        }
+
+        return {};
+    }
+
+    void C_ReactorIOCP::removeTimer(C_Timer& timer) noexcept
+    {
+        this->timerBucket_.remove(timer);
+    }
+
     void C_ReactorIOCP::run() noexcept
     {
         while (this->halt_.load() == false) {
@@ -78,19 +94,24 @@ namespace etsl
             ULONG_PTR completionKey = 0;
             WSAOVERLAPPED* overlapped = nullptr;
 
-            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, INFINITE);
-            if (completionKey == static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN)) {
-                continue;
-            }
+            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey,
+                &overlapped, this->timerBucket_.nextTimeout(clock_t::now())
+            );
 
-            if (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK) && overlapped) {
-                const auto taskInfo = reinterpret_cast<task_t*>(overlapped);
-                taskInfo->execute(taskInfo);
-                continue;
+            // Fire expired timers on every wake-up: IO completion, posted task or wait timeout.
+            const auto currentTime = clock_t::now();
+            while (const auto timer = this->timerBucket_.pop(currentTime)) {
+                timer->execute();
             }
 
             if (!overlapped) {
-                continue; // Ошибка самого IOCP порта.
+                continue; // Wait timeout or a posted wake-up (SHUTDOWN/ADD_TIMER) — nothing to dispatch.
+            }
+
+            if (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK)) {
+                const auto taskInfo = reinterpret_cast<task_t*>(overlapped);
+                taskInfo->execute(taskInfo);
+                continue;
             }
 
             const auto regInfo = static_cast<reg_info_t*>(overlapped);
@@ -107,7 +128,7 @@ namespace etsl
             char peek;
             if (const auto recvRes = recv(regInfo->fd, &peek, 1, MSG_PEEK); recvRes > 0) {
                 regInfo->cb(socket_event_flags_e::EV_READ, 0);
-                if (const auto rearmErr = rearmRead(regInfo); !rearmErr) {
+                if (const auto rearmErr = RearmRead(regInfo); !rearmErr) {
                     regInfo->cb(socket_event_flags_e::EV_ERROR, rearmErr.error());
                 }
             }
@@ -117,7 +138,7 @@ namespace etsl
             else { // recvRes < 0
                 switch (const auto wsaErr = WSAGetLastError()) {
                     case WSAEWOULDBLOCK:
-                        if (const auto rearmErr = rearmRead(regInfo); !rearmErr) {
+                        if (const auto rearmErr = RearmRead(regInfo); !rearmErr) {
                             regInfo->cb(socket_event_flags_e::EV_ERROR, rearmErr.error());
                         }
                         break;
@@ -136,11 +157,10 @@ namespace etsl
     void C_ReactorIOCP::shutdown() noexcept
     {
         this->halt_.store(true);
-        PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN),
-            nullptr);
+        PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN), nullptr);
     }
 
-    etl::expected<void, int32_t> C_ReactorIOCP::rearmRead(reg_info_t* reg) noexcept
+    etl::expected<void, int32_t> C_ReactorIOCP::RearmRead(reg_info_t* reg) noexcept
     {
         if (reg->is_closing) {
             return {};

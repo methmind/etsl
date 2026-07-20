@@ -30,7 +30,8 @@ namespace etsl
     {
         SHUTDOWN = 0,
         TASK,
-        IO
+        IO,
+        ADD_TIMER,
     };
 
     static_assert(std::is_base_of_v<WSAOVERLAPPED, reg_iocp_s>, "reg_iocp_s must inherit from WSAOVERLAPPED!");

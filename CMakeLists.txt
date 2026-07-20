@@ -20,12 +20,20 @@ target_sources(etsl
         src/win/wsa_initializer.cppm
         src/core/socket_types.cppm
         src/core/events.cppm
-        src/test/smoke_loopback.cppm
+        src/timer/timer_bucket.cppm
+        src/timer/timer.cppm
+        src/timer/timer_types.cppm
+        src/platform/net_types.cppm
+        src/platform/net_ops.cppm
+        src/socket/socket_address.cppm
     PRIVATE
         src/reactor/impl/iocp/reactor_iocp.cpp
         src/win/wsa_initializer.cpp
         src/socket/socket_independent.cpp
-        src/test/smoke_loopback.cpp
+        src/timer/timer_bucket.cpp
+        src/platform/etl_chrono.cpp
+        src/platform/net_ops.cpp
+        src/socket/socket_address.cpp
 )
 
 target_include_directories(etsl PUBLIC

@@ -172,11 +172,16 @@ src/
 ├── socket/
 │   ├── socket.cppm/.cpp       # RAII-хэндл + close (слить raii+independent)
 │   ├── socket_factory.cppm    # модуль socket.factory (имя файла = имя модуля)
-│   ├── address.cppm           # обёртка над sockaddr_storage            (Этап 2)
+│   ├── socket_address.cppm/.cpp  # обёртка над sockaddr_storage (C_Address) (Этап 2)
 │   ├── tcp_socket.cppm/.cpp   # Qt-подобный async API                  (Этап 2)
 │   └── tcp_server.cppm/.cpp   # AcceptEx                               (Этап 2)
+├── timer/                       # таймеры реактора                      (Этап 2, 2.1)
+│   ├── timer.cppm               # C_Timer: arm/execute; «взведён» ⇔ is_linked()
+│   ├── timer_types.cppm         # clock_t, time_point_t, timer_cb_t
+│   └── timer_bucket.cppm/.cpp   # сортированный intrusive-список дедлайнов
 └── platform/
-    └── wsa_initializer.cppm/.cpp  # только Windows; на Linux — отсутствует
+    ├── wsa_initializer.cppm/.cpp  # только Windows; на Linux — отсутствует
+    └── etl_chrono.cpp           # etl_get_steady_clock (QPC / clock_gettime) (Этап 2)
 ```
 
 Соглашения: имя файла модуля == имя модуля; `export module <domain>[.<sub>]`;
@@ -282,11 +287,22 @@ baseline размера зафиксирован.
 
 **Цель:** Qt-подобный async API поверх реактора; ноль `#ifdef` в этом слое.
 
-- [ ] **2.1** Таймеры в реакторе: intrusive-список дедлайнов, таймаут
+- [x] **2.1** Таймеры в реакторе: intrusive-список дедлайнов, таймаут
       `GetQueuedCompletionStatus` = время до ближайшего; нужны для backoff
-      записи и connect timeout.
-- [ ] **2.2** `socket/address.cppm`: обёртка над `sockaddr_storage`
-      (IPv4 сейчас, layout IPv6-ready — дёшево сейчас, дорого потом).
+      записи и connect timeout. Реализация: модули `timer` (`C_Timer`) и
+      `timer.bucket` (сортированный `etl::intrusive_list`), API реактора
+      `addTimer/removeTimer`; пробуждение цикла — completion `ADD_TIMER`.
+      Контракт: add/remove — только на потоке цикла (ADR-7). При проверке
+      исправлены: инвертированный предикат сортировки вставки и коллизия
+      пустого completion (таймаут GQCS) с `SHUTDOWN` (=0) в `run()`.
+      Проверено прогоном: порядок и дедлайны верны при взведении не по
+      порядку, `removeTimer` отменяет срабатывание, перевзведение из
+      колбэка работает. **(20.07.2026)**
+- [x] **2.2** `socket/socket_address.cppm`: модуль `socket.address`, класс `C_Address` —
+      обёртка над `sockaddr_storage` (IPv4 сейчас, layout IPv6-ready — дёшево
+      сейчас, дорого потом). Парсинг — `ParseIPV4` в `platform/net_ops`
+      (`inet_pton`, ошибка через `etl::expected`). Проверено сборкой и прогоном:
+      валидный IPv4 → `size()==16`, `sa_family==AF_INET`; невалидный IP → ошибка. **(20.07.2026)**
 - [ ] **2.3** `tcp_socket`: состояния по ADR-8; `ConnectEx` (гоча: перед
       `ConnectEx` сокет обязан быть `bind()` к wildcard); `read(span)`/
       `bytesAvailable()`/`onReadyRead`; `write(span)` → оптимистичный send →
@@ -351,7 +367,7 @@ baseline размера зафиксирован.
    == имя модуля.
 7. После каждого этапа — прогон `size-report`, сравнение с baseline/budget.
 8. Минимальные изменения: задача не должна тащить рефакторинг соседнего кода.
-9. Комментарии и идентификаторы — английский; этот файл — на русском.
+9. Язык проекта: RU/ENG — комментарии и документация допустимы на обоих языках.
 
 ---
 
