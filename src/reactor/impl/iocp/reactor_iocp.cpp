@@ -71,15 +71,9 @@ namespace etsl
         return {};
     }
 
-    etl::expected<void, int32_t> C_ReactorIOCP::addTimer(C_Timer& timer) noexcept
+    void C_ReactorIOCP::addTimer(C_Timer& timer) noexcept
     {
         this->timerBucket_.add(timer);
-        if (!PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::ADD_TIMER), nullptr)) {
-            removeTimer(timer);
-            return etl::unexpected(static_cast<int32_t>(GetLastError()));
-        }
-
-        return {};
     }
 
     void C_ReactorIOCP::removeTimer(C_Timer& timer) noexcept

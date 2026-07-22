@@ -26,7 +26,7 @@ extern "C" uint64_t etl_get_high_resolution_clock()
 {
     return etl_get_steady_clock();
 }
-#elif defined(_linux)
+#elif defined(__linux__)
 #include <time.h>
 
 extern "C" uint64_t etl_get_steady_clock()

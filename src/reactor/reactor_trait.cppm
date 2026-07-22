@@ -31,7 +31,7 @@ export namespace etsl
 
         { t.post(task) } noexcept -> std::same_as<etl::expected<void, int32_t>>;
 
-        { t.addTimer(timer) } noexcept -> std::same_as<etl::expected<void, int32_t>>;
+        { t.addTimer(timer) } noexcept -> std::same_as<void>;
 
         { t.removeTimer(timer) } noexcept -> std::same_as<void>;
     };

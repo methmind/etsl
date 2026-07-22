@@ -26,15 +26,7 @@ namespace etsl
     void C_TimerBucket::remove(C_Timer& timer) noexcept
     {
         assert(this->bucket_.contains_node(timer) && "You cannot delete a timer that does not exist!");
-
-        const auto it = etl::find_if(this->bucket_.begin(), this->bucket_.end(),
-            [&timer](const C_Timer& val) {
-                return &val == &timer;
-            }
-        );
-
-        assert(it != this->bucket_.end());
-        this->bucket_.erase(it);
+        this->bucket_.erase(timer);
     }
 
     uint32_t C_TimerBucket::nextTimeout(const time_point_t& now) const noexcept

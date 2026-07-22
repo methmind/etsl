@@ -34,7 +34,7 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<void, int32_t> post(task_t* task) noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> addTimer(C_Timer& timer) noexcept;
+        void addTimer(C_Timer& timer) noexcept;
 
         void removeTimer(C_Timer& timer) noexcept;
 
