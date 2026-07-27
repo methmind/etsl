@@ -2,14 +2,14 @@
 // Created by sexey on 23.05.2026.
 //
 module;
+#include <winsock2.h>
 #include <windows.h>
-#include "etl/atomic.h"
-#include "etl/expected.h"
+#include <etl/expected.h>
+#include <etl/intrusive_list.h>
 
 export module reactor.iocp;
 
 import socket.types;
-import socket.events;
 import :defs;
 
 import timer;
@@ -20,19 +20,20 @@ export namespace etsl
     class C_ReactorIOCP
     {
     public:
-        using reg_info_t = reg_iocp_s;
-        using task_t = task_node_iocp_s;
+        using operation_t = operation_iocp_s;
+        using task_t = task_iocp_s;
+        using dispose_operation_t = dispose_operation_iocp_s;
 
         ~C_ReactorIOCP() noexcept;
         C_ReactorIOCP() noexcept : halt_(false), iocp_(nullptr) {}
 
         [[nodiscard]] etl::expected<void, int32_t> initialize() noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> attach(socket_t fd, const socket_event_callback_t& cb, reg_info_t& reg) noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> associate(socket_t fd) noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> detach(socket_t fd, reg_info_t& reg) noexcept;
+        void detach(dispose_operation_t& operation) noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> post(task_t* task) noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> post(task_t& task) noexcept;
 
         void addTimer(C_Timer& timer) noexcept;
 
@@ -41,11 +42,14 @@ export namespace etsl
         void run() noexcept;
 
         void shutdown() noexcept;
-    private:
-        [[nodiscard]] static etl::expected<void, int32_t> RearmRead(reg_info_t* reg) noexcept;
 
-        etl::atomic<bool> halt_;
+    private:
+        __attribute__((always_inline)) static void DispatchOverlapped(ULONG_PTR completionKey, DWORD transferred, WSAOVERLAPPED* overlapped, bool success) noexcept;
+
+        bool halt_;
         HANDLE iocp_;
+
         C_TimerBucket timerBucket_;
+        etl::intrusive_list<dispose_operation_t, etl::bidirectional_link<0>> disposable_;
     };
 }

@@ -1,6 +1,9 @@
 //
 // Created by sexey on 29.05.2026.
 //
+module;
+#include <winsock2.h>
+
 export module socket.raii;
 import socket.types;
 import socket.independent;
@@ -45,13 +48,16 @@ export namespace etsl
 
         bool is_valid() const noexcept { return this->sock_ != INVALID_SOCKET_VALUE; }
 
-        void dispose() const noexcept
+        void dispose() noexcept
         {
             if (!is_valid()) {
                 return;
             }
 
-            CloseSocket(this->sock_);
+            shutdown(this->sock_, SD_BOTH);
+            closesocket(this->sock_);
+
+            this->sock_ = INVALID_SOCKET_VALUE;
         }
 
         explicit operator bool() const noexcept { return is_valid(); }

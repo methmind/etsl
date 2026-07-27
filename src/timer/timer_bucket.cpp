@@ -40,7 +40,7 @@ namespace etsl
             return 0;
         }
 
-        return static_cast<uint32_t>(etl::chrono::duration_cast<etl::chrono::milliseconds>(diff).count());
+        return etl::chrono::duration_cast<etl::chrono::milliseconds>(diff).count();
     }
 
     C_Timer* C_TimerBucket::pop(const time_point_t& now) noexcept

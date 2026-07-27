@@ -13,5 +13,5 @@ export namespace etsl
 
     using time_point_t = clock_t::time_point;
 
-    using timer_cb_t = etl::delegate<void()>;
+    using timer_callback_t = etl::delegate<void()>;
 }

@@ -15,7 +15,7 @@ export namespace etsl
     public:
         ~C_Timer() noexcept = default;
 
-        explicit C_Timer(const timer_cb_t& callback) noexcept : callback_(callback) {}
+        explicit C_Timer(const timer_callback_t& callback) noexcept : callback_(callback) {}
 
         void execute() const noexcept
         {
@@ -32,6 +32,6 @@ export namespace etsl
 
     private:
         time_point_t deadline_;
-        timer_cb_t callback_;
+        timer_callback_t callback_;
     };
 }

@@ -32,7 +32,7 @@ namespace etsl
             return etl::unexpected(res.error());
         }
 
-        this->iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 0);
+        this->iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
         if (!this->iocp_) {
             return etl::unexpected(static_cast<int32_t>(GetLastError()));
         }
@@ -40,31 +40,24 @@ namespace etsl
         return {};
     }
 
-    etl::expected<void, int32_t> C_ReactorIOCP::attach(const socket_t fd, const socket_event_callback_t& cb, reg_info_t& reg) noexcept
+    etl::expected<void, int32_t> C_ReactorIOCP::associate(const socket_t fd) noexcept
     {
-        reg = {.fd = fd, .cb = cb};
         if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(fd), this->iocp_,
             static_cast<ULONG_PTR>(iocp_code_e::IO), 0)) {
-            return etl::unexpected(static_cast<int32_t>(GetLastError()));
-        }
-
-        return RearmRead(&reg);
-    }
-
-    etl::expected<void, int32_t> C_ReactorIOCP::detach(socket_t fd, reg_info_t& reg) noexcept
-    {
-        reg.is_closing = true;
-        if (!CancelIoEx(reinterpret_cast<HANDLE>(fd), &reg)) {
             return etl::unexpected(static_cast<int32_t>(GetLastError()));
         }
 
         return {};
     }
 
-    etl::expected<void, int32_t> C_ReactorIOCP::post(task_t* task) noexcept
+    void C_ReactorIOCP::detach(dispose_operation_t& operation) noexcept
     {
-        if (!PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::TASK),
-            reinterpret_cast<LPOVERLAPPED>(task))) {
+        this->disposable_.push_back(operation);
+    }
+
+    etl::expected<void, int32_t> C_ReactorIOCP::post(task_t& task) noexcept
+    {
+        if (!PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::TASK), &task)) {
             return etl::unexpected(static_cast<int32_t>(GetLastError()));
         }
 
@@ -83,14 +76,13 @@ namespace etsl
 
     void C_ReactorIOCP::run() noexcept
     {
-        while (this->halt_.load() == false) {
+        while (this->halt_ == false) {
             DWORD bytesTransferred = 0;
             ULONG_PTR completionKey = 0;
             WSAOVERLAPPED* overlapped = nullptr;
 
-            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey,
-                &overlapped, this->timerBucket_.nextTimeout(clock_t::now())
-            );
+            const auto timeout = (this->disposable_.empty()) ? this->timerBucket_.nextTimeout(clock_t::now()) : 0;
+            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, timeout);
 
             // Fire expired timers on every wake-up: IO completion, posted task or wait timeout.
             const auto currentTime = clock_t::now();
@@ -98,82 +90,27 @@ namespace etsl
                 timer->execute();
             }
 
-            if (!overlapped) {
-                continue; // Wait timeout or a posted wake-up (SHUTDOWN/ADD_TIMER) — nothing to dispatch.
+            if (overlapped) {
+                DispatchOverlapped(completionKey, bytesTransferred, overlapped, ioStatus);
             }
 
-            if (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK)) {
-                const auto taskInfo = reinterpret_cast<task_t*>(overlapped);
-                taskInfo->execute(taskInfo);
-                continue;
-            }
-
-            const auto regInfo = static_cast<reg_info_t*>(overlapped);
-            if (regInfo->is_closing) {
-                continue; // Пришел aborted-completion от CancelIoEx. Теперь regInfo можно безопасно удалять.
-            }
-
-            DWORD resultFlags = 0;
-            if (!ioStatus && !WSAGetOverlappedResult(regInfo->fd, overlapped, &bytesTransferred, FALSE, &resultFlags)) {
-                regInfo->cb(socket_event_flags_e::EV_ERROR, WSAGetLastError());
-                continue;
-            }
-
-            char peek;
-            if (const auto recvRes = recv(regInfo->fd, &peek, 1, MSG_PEEK); recvRes > 0) {
-                regInfo->cb(socket_event_flags_e::EV_READ, 0);
-                if (const auto rearmErr = RearmRead(regInfo); !rearmErr) {
-                    regInfo->cb(socket_event_flags_e::EV_ERROR, rearmErr.error());
-                }
-            }
-            else if (recvRes == 0) {
-                regInfo->cb(socket_event_flags_e::EV_CLOSED, 0);
-            }
-            else { // recvRes < 0
-                switch (const auto wsaErr = WSAGetLastError()) {
-                    case WSAEWOULDBLOCK:
-                        if (const auto rearmErr = RearmRead(regInfo); !rearmErr) {
-                            regInfo->cb(socket_event_flags_e::EV_ERROR, rearmErr.error());
-                        }
-                        break;
-                    case WSAECONNRESET:
-                    case WSAECONNABORTED:
-                        regInfo->cb(socket_event_flags_e::EV_CLOSED, wsaErr);
-                        break;
-                    default:
-                        regInfo->cb(socket_event_flags_e::EV_ERROR, wsaErr);
-                        break;
-                }
+            while (!this->disposable_.empty()) {
+                this->disposable_.back().callback();
+                this->disposable_.pop_back();
             }
         }
     }
 
     void C_ReactorIOCP::shutdown() noexcept
     {
-        this->halt_.store(true);
+        this->halt_ = true;
         PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN), nullptr);
     }
 
-    etl::expected<void, int32_t> C_ReactorIOCP::RearmRead(reg_info_t* reg) noexcept
+    void C_ReactorIOCP::DispatchOverlapped(ULONG_PTR completionKey, DWORD transferred, WSAOVERLAPPED* overlapped, bool success) noexcept
     {
-        if (reg->is_closing) {
-            return {};
-        }
-
-        memset(reg, 0, sizeof(WSAOVERLAPPED));
-        DWORD flags = 0;
-        WSABUF buf{};
-
-        if (const auto res = WSARecv(reg->fd, &buf, 1, nullptr, &flags,
-            reg, nullptr); res == NO_ERROR) {
-            return {};
-        }
-
-        const auto err = WSAGetLastError();
-        if (err == WSA_IO_PENDING) {
-            return {};
-        }
-
-        return etl::unexpected(err);
+        (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK)) ?
+            reinterpret_cast<task_t*>(overlapped)->callback() :
+            reinterpret_cast<operation_t*>(overlapped)->callback(static_cast<uint32_t>(transferred), success ? 0 : static_cast<int32_t>(GetLastError()));
     }
 }
