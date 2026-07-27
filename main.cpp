@@ -235,12 +235,10 @@ private:
             }
         }
 
+        this->events_.onReadyRead(this->fd_.get());
         if (const auto err = createReadProbeOperation(); !err) {
             beginTeardown(err.error());
-            return;
         }
-
-        this->events_.onReadyRead(this->fd_.get());
     }
 
     void onReadinessOperation(uint32_t /* transferred */, int32_t error) noexcept
@@ -257,8 +255,6 @@ private:
                 break;
             case socket_state_e::CONNECTED:
                 onReadRoutine();
-                break;
-            case socket_state_e::DISPOSING:
                 break;
             default:
                 assert(false && "Invalid state!");
