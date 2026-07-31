@@ -243,7 +243,7 @@ namespace etsl
         this->state_ = tcp_socket_state_e::NONE;
         this->cachedDisposeReason_ = INVALID_CACHE_VALUE;
 
-        if (this->cachedDisposeReason_ == EXPLICIT_DISPOSE) {
+        if (stackReason == EXPLICIT_DISPOSE) {
             this->events_.onDisposed();
             return;
         }
