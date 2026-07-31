@@ -5,6 +5,7 @@ module;
 #include <winsock2.h>
 #include <mswsock.h>
 #include <cassert>
+#include <cstring>
 
 #include <etl/expected.h>
 #include <etl/endianness.h>
@@ -15,9 +16,14 @@ import socket.types;
 
 namespace etsl
 {
+    C_TCPSocketDriverIOCP::~C_TCPSocketDriverIOCP() noexcept
+    {
+        assert(this->pendingOps_ == 0 && "UAF error caught!");
+    }
+
     C_TCPSocketDriverIOCP::C_TCPSocketDriverIOCP(C_Reactor& reactor, const tcp_socket_driver_events_s& events) noexcept :
-        reactor_(reactor), fd_(INVALID_SOCKET), state_(tcp_socket_state_e::NONE), pendingOps_(0),
-        wasConnected_(false), cachedDisposeReason_(0), events_(events)
+        reactor_(reactor), fd_(INVALID_SOCKET_VALUE), state_(tcp_socket_state_e::NONE), pendingOps_(0),
+        wasConnected_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), events_(events)
     {
         assert((events.onReadyRead.is_valid() &&
             events.onCommit.is_valid() &&
@@ -32,10 +38,15 @@ namespace etsl
             C_TCPSocketDriverIOCP, &C_TCPSocketDriverIOCP::onDisposeOperation>(*this);
     }
 
+    void C_TCPSocketDriverIOCP::dispose() noexcept
+    {
+        beginTeardown(EXPLICIT_DISPOSE);
+    }
+
     etl::expected<void, int32_t> C_TCPSocketDriverIOCP::connect(const C_Address& addr) noexcept
     {
         if (this->state_ != tcp_socket_state_e::NONE || this->pendingOps_) {
-            return etl::unexpected(WSAEALREADY);
+            return etl::unexpected(static_cast<int32_t>(WSAEALREADY));
         }
 
         auto socketCreateResult = CreateSocket();
@@ -97,6 +108,11 @@ namespace etsl
         return {};
     }
 
+    void C_TCPSocketDriverIOCP::flushReadinessOperation() noexcept
+    {
+        memset(&this->readinessOperation_, 0, sizeof(WSAOVERLAPPED));
+    }
+
     etl::expected<void, int32_t> C_TCPSocketDriverIOCP::createConnectOperation(const C_Address& addr) noexcept
     {
         if (const auto err = this->reactor_.associate(this->fd_.get()); !err) {
@@ -121,7 +137,7 @@ namespace etsl
     etl::expected<void, int32_t> C_TCPSocketDriverIOCP::createReadProbeOperation() noexcept
     {
         if (this->state_ != tcp_socket_state_e::CONNECTED) {
-            return etl::unexpected(WSAEINVAL);
+            return etl::unexpected(static_cast<int32_t>(WSAEINVAL));
         }
 
         DWORD flags = 0;
@@ -138,30 +154,23 @@ namespace etsl
         return {};
     }
 
-    void C_TCPSocketDriverIOCP::beginTeardown(int32_t reason) noexcept
+    void C_TCPSocketDriverIOCP::beginTeardown(const int32_t reason) noexcept
     {
+        if (this->cachedDisposeReason_ == INVALID_CACHE_VALUE || reason == EXPLICIT_DISPOSE) {
+            this->cachedDisposeReason_ = reason;
+        }
+
+        if (this->fd_.is_valid()) {
+            this->wasConnected_ = (this->state_ == tcp_socket_state_e::CONNECTED);
+            this->fd_.dispose();
+        }
+
         if (this->disposeOperation_.is_linked()) {
             return;
         }
 
-        if (this->state_ != tcp_socket_state_e::DISPOSING) {
-            this->wasConnected_ = (this->state_ == tcp_socket_state_e::CONNECTED);
-            this->cachedDisposeReason_ = reason;
-            this->state_ = tcp_socket_state_e::DISPOSING;
-            this->fd_.dispose();
-        }
-
-        if (this->pendingOps_) {
-            return;
-        }
-
-        this->state_ = tcp_socket_state_e::NONE;
-        if (this->cachedDisposeReason_ == EXPLICIT_DISPOSE) {
-            this->reactor_.detach(this->disposeOperation_);
-            return;
-        }
-
-        (this->wasConnected_) ? this->events_.onDisconnect(reason) : this->events_.onConnect(reason);
+        this->state_ = tcp_socket_state_e::DISPOSING;
+        this->reactor_.detach(this->disposeOperation_);
     }
 
     void C_TCPSocketDriverIOCP::onConnectRoutine() noexcept
@@ -222,5 +231,25 @@ namespace etsl
                 assert(false && "Invalid state!");
                 break;
         }
+    }
+
+    void C_TCPSocketDriverIOCP::onDisposeOperation() noexcept
+    {
+        if (this->pendingOps_) {
+            return;
+        }
+
+        auto stackReason = this->cachedDisposeReason_;
+        this->state_ = tcp_socket_state_e::NONE;
+        this->cachedDisposeReason_ = INVALID_CACHE_VALUE;
+
+        if (this->cachedDisposeReason_ == EXPLICIT_DISPOSE) {
+            this->events_.onDisposed();
+            return;
+        }
+
+        (this->wasConnected_) ?
+            this->events_.onDisconnect(stackReason) :
+            this->events_.onConnect(stackReason);
     }
 }

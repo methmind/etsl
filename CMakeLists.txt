@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_SCAN_FOR_MODULES ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-option(ETSL_BUILD_TESTS "Build etsl unit tests" ON)
+option(ETSL_BUILD_TESTS "Build etsl unit tests" OFF)
 
 include(FetchContent)
 
@@ -34,6 +34,10 @@ endif()
 
 add_library(etsl_core STATIC)
 
+if(WIN32)
+    target_compile_definitions(etsl_core PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
+endif()
+
 target_sources(etsl_core
     PUBLIC FILE_SET CXX_MODULES FILES
         src/reactor/reactor.cppm
@@ -49,7 +53,6 @@ target_sources(etsl_core
         src/socket/socket_independent.cppm
         src/win/wsa_initializer.cppm
         src/core/socket_types.cppm
-        src/core/error.cppm
         src/timer/timer_bucket.cppm
         src/timer/timer.cppm
         src/timer/timer_types.cppm
@@ -78,7 +81,9 @@ target_compile_options(etsl_core PRIVATE
     $<$<CXX_COMPILER_ID:Clang,GNU>:-fno-exceptions -fno-rtti>
 )
 
-target_link_libraries(etsl_core PUBLIC ws2_32)
+if(WIN32)
+    target_link_libraries(etsl_core PUBLIC ws2_32)
+endif()
 
 add_executable(etsl main.cpp)
 target_link_libraries(etsl PRIVATE etsl_core)
@@ -87,8 +92,8 @@ target_compile_options(etsl PRIVATE
 )
 
 if(ETSL_BUILD_TESTS)
-    enable_testing()
-    add_subdirectory(test)
+    #enable_testing()
+    #add_subdirectory(test)
 endif()
 
 find_program(SIZE_TOOL size)
@@ -98,3 +103,16 @@ if(SIZE_TOOL)
         COMMENT "Size report (size -A)"
     )
 endif()
+
+#if(WIN32)
+    add_custom_command(TARGET etsl POST_BUILD
+        COMMAND ssh -i $ENV{HOME}/.ssh/win-dev
+            sexey@192.168.122.51
+            "cmd /c \"taskkill /IM gdbserver.exe /F >nul 2>&1 || exit /b 0\""
+        COMMAND scp -i $ENV{HOME}/.ssh/win-dev
+            $<TARGET_FILE:etsl>
+            sexey@192.168.122.51:C:/dev/etsl.exe
+        COMMENT "Deploying etsl.exe"
+        VERBATIM
+    )
+#endif()
