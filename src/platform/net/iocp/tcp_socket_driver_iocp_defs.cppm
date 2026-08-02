@@ -2,9 +2,11 @@
 // Created by sexey on 27.07.2026.
 //
 module;
-#include <cstdint>
+#include <etl/span.h>
 
 export module net.tcp_socket_driver.iocp:defs;
+
+import reactor;
 
 namespace etsl
 {
@@ -18,5 +20,11 @@ namespace etsl
         CONNECTING,
         CONNECTED,
         DISPOSING,
+    };
+
+    struct send_operation_s : C_Reactor::operation_t
+    {
+        etl::span<uint8_t> content;
+        uint32_t transferred;
     };
 }

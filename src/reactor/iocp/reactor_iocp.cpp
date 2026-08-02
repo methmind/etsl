@@ -4,7 +4,6 @@
 module;
 #include <winsock2.h>
 #include <windows.h>
-#include <cstdint>
 
 #include "etl/expected.h"
 
@@ -109,8 +108,12 @@ namespace etsl
 
     void C_ReactorIOCP::DispatchOverlapped(ULONG_PTR completionKey, DWORD transferred, WSAOVERLAPPED* overlapped, bool success) noexcept
     {
-        (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK)) ?
-            reinterpret_cast<task_t*>(overlapped)->callback() :
-            reinterpret_cast<operation_t*>(overlapped)->callback(static_cast<uint32_t>(transferred), success ? 0 : static_cast<int32_t>(GetLastError()));
+        if (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK)) {
+            reinterpret_cast<task_t*>(overlapped)->callback();
+            return;
+        }
+
+        const auto operation = reinterpret_cast<operation_t*>(overlapped);
+        operation->callback(*operation, transferred, success ? 0 : static_cast<int32_t>(GetLastError()));
     }
 }

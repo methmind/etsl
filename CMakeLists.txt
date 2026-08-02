@@ -92,8 +92,8 @@ target_compile_options(etsl PRIVATE
 )
 
 if(ETSL_BUILD_TESTS)
-    #enable_testing()
-    #add_subdirectory(test)
+    enable_testing()
+    add_subdirectory(test)
 endif()
 
 find_program(SIZE_TOOL size)

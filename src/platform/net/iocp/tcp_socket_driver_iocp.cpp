@@ -63,12 +63,18 @@ namespace etsl
         return {};
     }
 
+    etl::expected<void, int32_t> C_TCPSocketDriverIOCP::send(send_operation_t& operation) noexcept
+    {
+        return createSendOperation(operation);
+    }
+
     etl::expected<void, int32_t> C_TCPSocketDriverIOCP::EphemeralBind(const socket_t fd) noexcept
     {
-        sockaddr_in addrAny{};
-        addrAny.sin_family = AF_INET;
-        addrAny.sin_port = 0;
-        addrAny.sin_addr.s_addr = etl::hton<uint32_t>(INADDR_ANY);
+        constexpr sockaddr_in addrAny{
+            .sin_family = AF_INET,
+            .sin_port = 0,
+            .sin_addr.s_addr = etl::hton<uint32_t>(INADDR_ANY)
+        };
 
         if (bind(fd, reinterpret_cast<const sockaddr*>(&addrAny), sizeof(addrAny)) == SOCKET_ERROR) {
             return etl::unexpected(WSAGetLastError());
@@ -154,6 +160,31 @@ namespace etsl
         return {};
     }
 
+    etl::expected<void, int32_t> C_TCPSocketDriverIOCP::createSendOperation(send_operation_t& operation) noexcept
+    {
+        if (this->state_ != tcp_socket_state_e::CONNECTED) {
+            return etl::unexpected(static_cast<int32_t>(WSAEINVAL));
+        }
+
+        ZeroMemory(static_cast<WSAOVERLAPPED*>(&operation), sizeof(WSAOVERLAPPED));
+        operation.callback = decltype(operation.callback)::create<
+            C_TCPSocketDriverIOCP, &C_TCPSocketDriverIOCP::onSendOperation>(*this);
+
+        WSABUF buffer = {
+            .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
+            .buf = reinterpret_cast<char*>(operation.content.data() + operation.transferred),
+        };
+
+        if (WSASend(this->fd_.get(), &buffer, 1, nullptr, 0, &operation, nullptr) != ERROR_SUCCESS) {
+            if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
+                return etl::unexpected(err);
+            }
+        }
+
+        this->pendingOps_++;
+        return {};
+    }
+
     void C_TCPSocketDriverIOCP::beginTeardown(const int32_t reason) noexcept
     {
         if (this->cachedDisposeReason_ == INVALID_CACHE_VALUE || reason == EXPLICIT_DISPOSE) {
@@ -165,17 +196,21 @@ namespace etsl
             this->fd_.dispose();
         }
 
+        this->state_ = tcp_socket_state_e::DISPOSING;
+        if (this->pendingOps_) {
+            return;
+        }
+
         if (this->disposeOperation_.is_linked()) {
             return;
         }
 
-        this->state_ = tcp_socket_state_e::DISPOSING;
         this->reactor_.detach(this->disposeOperation_);
     }
 
     void C_TCPSocketDriverIOCP::onConnectRoutine() noexcept
     {
-        if (setsockopt(this->fd_.get(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) == SOCKET_ERROR) {
+        if (setsockopt(this->fd_.get(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) != ERROR_SUCCESS) {
             beginTeardown(WSAGetLastError());
             return;
         }
@@ -209,7 +244,7 @@ namespace etsl
         }
     }
 
-    void C_TCPSocketDriverIOCP::onReadinessOperation(uint32_t, const int32_t error) noexcept
+    void C_TCPSocketDriverIOCP::onReadinessOperation(C_Reactor::operation_t&, uint32_t, const int32_t error) noexcept
     {
         this->pendingOps_--;
         if (error != ERROR_SUCCESS) {
@@ -233,11 +268,29 @@ namespace etsl
         }
     }
 
-    void C_TCPSocketDriverIOCP::onDisposeOperation() noexcept
+    void C_TCPSocketDriverIOCP::onSendOperation(C_Reactor::operation_t& operation, uint32_t transferred, int32_t error) noexcept
     {
-        if (this->pendingOps_) {
+        this->pendingOps_--;
+        if (error != ERROR_SUCCESS || this->state_ == tcp_socket_state_e::DISPOSING) {
+            beginTeardown(error);
             return;
         }
+
+        auto& sendOperation = reinterpret_cast<send_operation_t&>(operation);
+        sendOperation.transferred += transferred;
+        if (sendOperation.transferred < sendOperation.content.size()) {
+            if (const auto err = createSendOperation(sendOperation); !err) {
+                beginTeardown(err.error());
+            }
+            return;
+        }
+
+        this->events_.onCommit(operation, 0);
+    }
+
+    void C_TCPSocketDriverIOCP::onDisposeOperation() noexcept
+    {
+        assert(this->pendingOps_ == 0 && "Dangling operations!");
 
         auto stackReason = this->cachedDisposeReason_;
         this->state_ = tcp_socket_state_e::NONE;

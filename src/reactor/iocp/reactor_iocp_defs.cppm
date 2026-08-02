@@ -4,6 +4,7 @@
 module;
 #include <type_traits>
 #include <winsock2.h>
+
 #include <etl/delegate.h>
 #include <etl/intrusive_list.h>
 
@@ -11,13 +12,24 @@ export module reactor.iocp:defs;
 
 namespace etsl
 {
-    using iocp_operation_callback_t = etl::delegate<void(uint32_t bytes, int32_t error)>;
+    struct operation_iocp_s;
+
+    using iocp_operation_callback_t = etl::delegate<void(operation_iocp_s& operation, uint32_t bytes, int32_t error)>;
 
     using iocp_simple_callback_t = etl::delegate<void()>;
 
     struct operation_iocp_s : WSAOVERLAPPED // NOLINT(*-pro-type-member-init)
     {
         iocp_operation_callback_t callback{};
+
+        ~operation_iocp_s() = default;
+        operation_iocp_s() = default;
+
+        operation_iocp_s(const operation_iocp_s&) = delete;
+        operation_iocp_s& operator=(const operation_iocp_s&) = delete;
+
+        operation_iocp_s(operation_iocp_s&&) = delete;
+        operation_iocp_s& operator=(operation_iocp_s&&) = delete;
     };
 
     struct task_iocp_s : WSAOVERLAPPED // NOLINT(*-pro-type-member-init)
