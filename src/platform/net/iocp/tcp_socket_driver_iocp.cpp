@@ -270,9 +270,17 @@ namespace etsl
 
     void C_TCPSocketDriverIOCP::onSendOperation(C_Reactor::operation_t& operation, uint32_t transferred, int32_t error) noexcept
     {
+        auto finalize = [this, &operation](int32_t error) noexcept {
+            if (error != ERROR_SUCCESS) {
+                beginTeardown(error);
+            }
+
+            this->events_.onCommit(operation, error);
+        };
+
         this->pendingOps_--;
         if (error != ERROR_SUCCESS || this->state_ == tcp_socket_state_e::DISPOSING) {
-            beginTeardown(error);
+            finalize(error);
             return;
         }
 
@@ -280,12 +288,12 @@ namespace etsl
         sendOperation.transferred += transferred;
         if (sendOperation.transferred < sendOperation.content.size()) {
             if (const auto err = createSendOperation(sendOperation); !err) {
-                beginTeardown(err.error());
+                finalize(err.error());
             }
             return;
         }
 
-        this->events_.onCommit(operation, 0);
+        finalize(ERROR_SUCCESS);
     }
 
     void C_TCPSocketDriverIOCP::onDisposeOperation() noexcept

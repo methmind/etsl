@@ -4,12 +4,14 @@
 #include <ws2tcpip.h>
 
 #include <etl/chrono.h>
+#include <etl/span.h>
 
 #include <atomic>
 #include <chrono>
 #include <cstring>
 #include <optional>
 #include <thread>
+#include <vector>
 
 import reactor;
 import timer;
@@ -102,6 +104,35 @@ public:
         return true;
     }
 
+    [[nodiscard]] bool RecvExact(char* data, const int len, const DWORD timeoutMs = 2000) const noexcept
+    {
+        if (accepted_ == INVALID_SOCKET) {
+            return false;
+        }
+
+        int got = 0;
+        while (got < len) {
+            fd_set readSet;
+            FD_ZERO(&readSet);
+            FD_SET(accepted_, &readSet);
+
+            timeval tv{};
+            tv.tv_sec = static_cast<long>(timeoutMs / 1000);
+            tv.tv_usec = static_cast<long>((timeoutMs % 1000) * 1000);
+
+            if (::select(0, &readSet, nullptr, nullptr, &tv) <= 0) {
+                return false;
+            }
+
+            const int n = ::recv(accepted_, data + got, len - got, 0);
+            if (n <= 0) {
+                return false;
+            }
+            got += n;
+        }
+        return true;
+    }
+
     void CloseAccepted() noexcept
     {
         if (accepted_ == INVALID_SOCKET) {
@@ -157,6 +188,7 @@ protected:
     using C_Reactor = etsl::C_Reactor;
     using C_Timer = etsl::C_Timer;
     using C_TCPSocketDriverIOCP = etsl::C_TCPSocketDriverIOCP;
+    using send_operation_t = C_TCPSocketDriverIOCP::send_operation_t;
     using tcp_socket_driver_events_s = etsl::tcp_socket_driver_events_s;
 
     void SetUp() override
@@ -272,7 +304,33 @@ protected:
         }
     }
 
-    void OnCommit(C_Reactor::operation_t&, int32_t) noexcept {}
+    void OnCommit(C_Reactor::operation_t& operation, const int32_t error) noexcept
+    {
+        commitCount_++;
+        lastCommitError_ = error;
+        lastCommitOperation_ = &operation;
+
+        if (sendOnCommit_ != nullptr && error == 0) {
+            auto* next = sendOnCommit_;
+            sendOnCommit_ = nullptr;
+            const auto again = driver_->send(*next);
+            chainedSendAttempted_ = true;
+            chainedSendOk_ = again.has_value();
+            if (!again) {
+                chainedSendError_ = again.error();
+            }
+            return;
+        }
+
+        if (disposeOnCommit_) {
+            DisposeAndStop();
+            return;
+        }
+
+        if (stopOnCommit_) {
+            StopReactor();
+        }
+    }
 
     void OnConnect(const int32_t error) noexcept
     {
@@ -303,6 +361,16 @@ protected:
             return;
         }
 
+        if (error == 0 && sendOnConnect_ != nullptr) {
+            const auto sent = driver_->send(*sendOnConnect_);
+            sendOnConnectAttempted_ = true;
+            sendOnConnectOk_ = sent.has_value();
+            if (!sent) {
+                sendOnConnectError_ = sent.error();
+            }
+            sendOnConnect_ = nullptr;
+        }
+
         if (disposeOnConnect_ && error == 0) {
             DisposeAndStop();
             return;
@@ -311,6 +379,18 @@ protected:
         if (scheduleDisposeOnConnectMs_ >= 0 && error == 0) {
             ScheduleDispose(scheduleDisposeOnConnectMs_);
             scheduleDisposeOnConnectMs_ = -1;
+            return;
+        }
+
+        if (scheduleSendOnConnectMs_ >= 0 && error == 0 && delayedSendOp_ != nullptr) {
+            ScheduleSend(*delayedSendOp_, scheduleSendOnConnectMs_);
+            scheduleSendOnConnectMs_ = -1;
+            delayedSendOp_ = nullptr;
+            return;
+        }
+
+        if (error == 0 && sendOnConnectAttempted_ && sendOnConnectOk_
+            && !disposeOnConnect_ && !stopOnConnect_) {
             return;
         }
 
@@ -354,7 +434,36 @@ protected:
         if (actionDispose_) {
             actionDispose_ = false;
             DisposeAndStop();
+            return;
         }
+
+        if (actionSend_ != nullptr) {
+            auto* op = actionSend_;
+            actionSend_ = nullptr;
+            const auto sent = driver_->send(*op);
+            delayedSendAttempted_ = true;
+            delayedSendOk_ = sent.has_value();
+            if (!sent) {
+                delayedSendError_ = sent.error();
+            }
+        }
+    }
+
+    void ScheduleSend(send_operation_t& operation, const int32_t delayMs)
+    {
+        actionSend_ = &operation;
+        actionTimer_.emplace(timer_callback_t::create<TCPSocketDriverIOCPTest,
+            &TCPSocketDriverIOCPTest::OnActionTimer>(*this));
+        auto deadline = clock_t::now();
+        deadline += etl::chrono::duration_cast<clock_t::duration>(etl::chrono::milliseconds(delayMs));
+        actionTimer_->arm(deadline);
+        reactor_.addTimer(*actionTimer_);
+    }
+
+    void PrepareSend(send_operation_t& operation, uint8_t* data, const size_t len) noexcept
+    {
+        operation.content = etl::span<uint8_t>{data, len};
+        operation.transferred = 0;
     }
 
     void OnTimeout() noexcept
@@ -376,30 +485,49 @@ protected:
     int connectCount_{0};
     int disconnectCount_{0};
     int disposedCount_{0};
+    int commitCount_{0};
     int32_t lastConnectError_{0};
     int32_t lastDisconnectError_{0};
+    int32_t lastCommitError_{0};
     int32_t secondConnectError_{0};
     int32_t reconnectError_{0};
+    int32_t sendOnConnectError_{0};
+    int32_t chainedSendError_{0};
+    int32_t delayedSendError_{0};
     socket_t lastReadyFd_{INVALID_SOCKET};
+    C_Reactor::operation_t* lastCommitOperation_{nullptr};
+    send_operation_t* sendOnConnect_{nullptr};
+    send_operation_t* sendOnCommit_{nullptr};
+    send_operation_t* actionSend_{nullptr};
+    send_operation_t* delayedSendOp_{nullptr};
     bool timedOut_{false};
     bool secondConnectAttempted_{false};
     bool secondConnectOk_{false};
     bool reconnectAttempted_{false};
     bool reconnectOk_{false};
     bool actionDispose_{false};
+    bool sendOnConnectAttempted_{false};
+    bool sendOnConnectOk_{false};
+    bool chainedSendAttempted_{false};
+    bool chainedSendOk_{false};
+    bool delayedSendAttempted_{false};
+    bool delayedSendOk_{false};
 
     bool stopOnReadyRead_{false};
     bool stopOnConnect_{false};
     bool stopOnDisconnect_{false};
     bool stopOnDisposed_{false};
+    bool stopOnCommit_{false};
     bool disposeOnConnect_{false};
     bool disposeOnReadyRead_{false};
+    bool disposeOnCommit_{false};
     bool consumeReadyRead_{false};
     bool captureReadyReadPayload_{false};
     bool reconnectOnConnectError_{false};
     bool reconnectOnDisposed_{false};
     int disposeAfterReadyReads_{0};
     int scheduleDisposeOnConnectMs_{-1};
+    int scheduleSendOnConnectMs_{-1};
     char capturedPayload_[64]{};
     int capturedPayloadLen_{0};
 };
@@ -924,6 +1052,186 @@ TEST_F(TCPSocketDriverIOCPTest, ExplicitDisposeAfterReadyReadDoesNotEmitDisconne
     EXPECT_GE(readyReadCount_, 1);
     EXPECT_EQ(disposedCount_, 1);
     EXPECT_EQ(disconnectCount_, 0);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, SendBeforeConnectReturnsInvalid)
+{
+    uint8_t bytes[] = {'x'};
+    send_operation_t op{};
+    PrepareSend(op, bytes, sizeof(bytes));
+
+    const auto result = driver_->send(op);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(commitCount_, 0);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, SendAfterDisposeReturnsInvalid)
+{
+    stopOnDisposed_ = true;
+    driver_->dispose();
+    RunReactor();
+    ASSERT_EQ(disposedCount_, 1);
+
+    uint8_t bytes[] = {'x'};
+    send_operation_t op{};
+    PrepareSend(op, bytes, sizeof(bytes));
+
+    const auto result = driver_->send(op);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(commitCount_, 0);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, SendAfterConnectInvokesOnCommitAndDeliversPayload)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Address addr;
+    ASSERT_TRUE(MakeAddress(listener.Port(), addr));
+
+    static constexpr char kPayload[] = "send-payload";
+    static constexpr int kPayloadLen = static_cast<int>(sizeof(kPayload) - 1);
+    uint8_t bytes[sizeof(kPayload) - 1];
+    std::memcpy(bytes, kPayload, static_cast<size_t>(kPayloadLen));
+
+    send_operation_t op{};
+    PrepareSend(op, bytes, static_cast<size_t>(kPayloadLen));
+    sendOnConnect_ = &op;
+    disposeOnCommit_ = true;
+
+    char received[sizeof(kPayload)]{};
+    std::atomic<bool> gotPayload{false};
+
+    std::thread peerThread([&] {
+        if (!listener.Accept(2000)) {
+            return;
+        }
+        gotPayload.store(listener.RecvExact(received, kPayloadLen));
+    });
+
+    ASSERT_TRUE(driver_->connect(addr).has_value());
+    RunReactor();
+    peerThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(sendOnConnectAttempted_);
+    EXPECT_TRUE(sendOnConnectOk_);
+    EXPECT_TRUE(gotPayload.load());
+    EXPECT_EQ(std::memcmp(received, kPayload, static_cast<size_t>(kPayloadLen)), 0);
+    ASSERT_EQ(commitCount_, 1);
+    EXPECT_EQ(lastCommitError_, 0);
+    EXPECT_EQ(lastCommitOperation_, static_cast<C_Reactor::operation_t*>(&op));
+    EXPECT_EQ(op.transferred, static_cast<uint32_t>(kPayloadLen));
+    EXPECT_EQ(disposedCount_, 1);
+    EXPECT_EQ(disconnectCount_, 0);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, SequentialSendsFromOnCommit)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Address addr;
+    ASSERT_TRUE(MakeAddress(listener.Port(), addr));
+
+    uint8_t firstBytes[] = {'A', 'A', 'A', 'A'};
+    uint8_t secondBytes[] = {'B', 'B', 'B', 'B'};
+    send_operation_t first{};
+    send_operation_t second{};
+    PrepareSend(first, firstBytes, sizeof(firstBytes));
+    PrepareSend(second, secondBytes, sizeof(secondBytes));
+
+    sendOnConnect_ = &first;
+    sendOnCommit_ = &second;
+    disposeOnCommit_ = true;
+
+    char received[8]{};
+    std::atomic<bool> gotPayload{false};
+
+    std::thread peerThread([&] {
+        if (!listener.Accept(2000)) {
+            return;
+        }
+        gotPayload.store(listener.RecvExact(received, 8));
+    });
+
+    ASSERT_TRUE(driver_->connect(addr).has_value());
+    RunReactor();
+    peerThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(sendOnConnectOk_);
+    EXPECT_TRUE(chainedSendAttempted_);
+    EXPECT_TRUE(chainedSendOk_);
+    EXPECT_TRUE(gotPayload.load());
+    EXPECT_EQ(std::memcmp(received, "AAAABBBB", 8), 0);
+    EXPECT_EQ(commitCount_, 2);
+    EXPECT_EQ(disposedCount_, 1);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, DisposeDuringPendingSendInvokesOnDisposed)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Address addr;
+    ASSERT_TRUE(MakeAddress(listener.Port(), addr));
+
+    // Large-ish payload increases chance the send is still in-flight when dispose runs.
+    std::vector<uint8_t> bytes(64 * 1024, static_cast<uint8_t>('Z'));
+    send_operation_t op{};
+    PrepareSend(op, bytes.data(), bytes.size());
+    sendOnConnect_ = &op;
+    disposeOnConnect_ = true;
+
+    std::thread acceptThread([&] {
+        (void)listener.Accept(2000);
+    });
+
+    ASSERT_TRUE(driver_->connect(addr).has_value());
+    RunReactor();
+    acceptThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(sendOnConnectAttempted_);
+    EXPECT_TRUE(sendOnConnectOk_);
+    EXPECT_EQ(disposedCount_, 1);
+    // onCommit must not report success after explicit dispose mid-send.
+    EXPECT_EQ(commitCount_, 0);
+    EXPECT_EQ(disconnectCount_, 0);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, SendWhileConnectingReturnsInvalid)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Address addr;
+    ASSERT_TRUE(MakeAddress(listener.Port(), addr));
+
+    disposeOnConnect_ = true;
+
+    std::thread acceptThread([&] {
+        (void)listener.Accept(2000);
+    });
+
+    ASSERT_TRUE(driver_->connect(addr).has_value());
+
+    uint8_t bytes[] = {'x'};
+    send_operation_t op{};
+    PrepareSend(op, bytes, sizeof(bytes));
+    const auto result = driver_->send(op);
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+
+    RunReactor();
+    acceptThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_EQ(commitCount_, 0);
+    EXPECT_EQ(disposedCount_, 1);
 }
 
 } // namespace
