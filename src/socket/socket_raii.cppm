@@ -15,6 +15,8 @@ export namespace etsl
     public:
         ~C_Socket() noexcept { dispose(); }
 
+        C_Socket() noexcept : sock_(INVALID_SOCKET_VALUE) {}
+
         explicit C_Socket(socket_t sock = INVALID_SOCKET_VALUE) noexcept : sock_(sock) {}
 
         C_Socket(const C_Socket&) = delete;

@@ -83,14 +83,14 @@ namespace etsl
             const auto timeout = (this->disposable_.empty()) ? this->timerBucket_.nextTimeout(clock_t::now()) : 0;
             const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, timeout);
 
-            // Fire expired timers on every wake-up: IO completion, posted task or wait timeout.
             const auto currentTime = clock_t::now();
             while (const auto timer = this->timerBucket_.pop(currentTime)) {
                 timer->execute();
             }
 
             if (overlapped) {
-                DispatchOverlapped(completionKey, bytesTransferred, overlapped, ioStatus);
+                const auto operation = reinterpret_cast<operation_t*>(overlapped);
+                operation->callback(*operation, bytesTransferred, ioStatus ? 0 : static_cast<int32_t>(GetLastError()));
             }
 
             while (!this->disposable_.empty()) {
@@ -104,16 +104,5 @@ namespace etsl
     {
         this->halt_ = true;
         PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN), nullptr);
-    }
-
-    void C_ReactorIOCP::DispatchOverlapped(ULONG_PTR completionKey, DWORD transferred, WSAOVERLAPPED* overlapped, bool success) noexcept
-    {
-        if (completionKey == static_cast<ULONG_PTR>(iocp_code_e::TASK)) {
-            reinterpret_cast<task_t*>(overlapped)->callback();
-            return;
-        }
-
-        const auto operation = reinterpret_cast<operation_t*>(overlapped);
-        operation->callback(*operation, transferred, success ? 0 : static_cast<int32_t>(GetLastError()));
     }
 }

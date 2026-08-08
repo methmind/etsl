@@ -59,6 +59,7 @@ target_sources(etsl_core
         src/platform/net_types.cppm
         src/platform/net_ops.cppm
         src/socket/socket_address.cppm
+        src/platform/net/tcp_socket_driver_delegate_trait.cppm
     PRIVATE
         src/reactor/iocp/reactor_iocp.cpp
         src/win/wsa_initializer.cpp
@@ -67,7 +68,6 @@ target_sources(etsl_core
         src/platform/etl_chrono.cpp
         src/platform/net_ops.cpp
         src/socket/socket_address.cpp
-        src/platform/net/iocp/tcp_socket_driver_iocp.cpp
 )
 
 target_include_directories(etsl_core PUBLIC

@@ -44,8 +44,6 @@ export namespace etsl
         void shutdown() noexcept;
 
     private:
-        __attribute__((always_inline)) static void DispatchOverlapped(ULONG_PTR completionKey, DWORD transferred, WSAOVERLAPPED* overlapped, bool success) noexcept;
-
         bool halt_;
         HANDLE iocp_;
 

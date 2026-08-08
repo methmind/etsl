@@ -17,8 +17,7 @@ import reactor;
 import timer;
 import socket.address;
 import socket.types;
-import net.tcp_socket_driver.types;
-import net.tcp_socket_driver.iocp;
+import net.tcp_socket_driver;
 
 namespace {
 
@@ -175,38 +174,176 @@ private:
 
 class TCPSocketDriverIOCPTest : public ::testing::Test
 {
-protected:
-    using on_ready_read_callback_t = etsl::on_ready_read_callback_t;
-    using on_commit_callback_t = etsl::on_commit_callback_t;
-    using on_connect_callback_t = etsl::on_connect_callback_t;
-    using on_disconnect_callback_t = etsl::on_disconnect_callback_t;
-    using on_disposed_callback_t = etsl::on_disposed_callback_t;
+public:
     using clock_t = etsl::clock_t;
     using timer_callback_t = etsl::timer_callback_t;
     using socket_t = etsl::socket_t;
     using C_Address = etsl::C_Address;
     using C_Reactor = etsl::C_Reactor;
     using C_Timer = etsl::C_Timer;
-    using C_TCPSocketDriverIOCP = etsl::C_TCPSocketDriverIOCP;
-    using send_operation_t = C_TCPSocketDriverIOCP::send_operation_t;
-    using tcp_socket_driver_events_s = etsl::tcp_socket_driver_events_s;
+    using send_operation_t = etsl::send_operation_t;
+    using Driver = etsl::C_TCPSocketDriver<TCPSocketDriverIOCPTest>;
 
+    void onReadyRead(socket_t fd) noexcept
+    {
+        readyReadCount_++;
+        lastReadyFd_ = fd;
+
+        if (captureReadyReadPayload_) {
+            capturedPayloadLen_ = 0;
+            while (capturedPayloadLen_ < static_cast<int>(sizeof(capturedPayload_))) {
+                const int n = ::recv(fd, capturedPayload_ + capturedPayloadLen_,
+                    static_cast<int>(sizeof(capturedPayload_)) - capturedPayloadLen_, 0);
+                if (n > 0) {
+                    capturedPayloadLen_ += n;
+                    continue;
+                }
+                break;
+            }
+        } else if (consumeReadyRead_) {
+            char buf[64];
+            while (::recv(fd, buf, sizeof(buf), 0) > 0) {
+            }
+        }
+
+        if (disposeAfterReadyReads_ > 0 && readyReadCount_ >= disposeAfterReadyReads_) {
+            DisposeAndStop();
+            return;
+        }
+
+        if (disposeOnReadyRead_) {
+            DisposeAndStop();
+            return;
+        }
+
+        if (stopOnReadyRead_) {
+            StopReactor();
+        }
+    }
+
+    void onCommit(C_Reactor::operation_t& operation, const int32_t error) noexcept
+    {
+        commitCount_++;
+        lastCommitError_ = error;
+        lastCommitOperation_ = &operation;
+
+        if (sendOnCommit_ != nullptr && error == 0) {
+            auto* next = sendOnCommit_;
+            sendOnCommit_ = nullptr;
+            const auto again = driver_->send(*next);
+            chainedSendAttempted_ = true;
+            chainedSendOk_ = again.has_value();
+            if (!again) {
+                chainedSendError_ = again.error();
+            }
+            return;
+        }
+
+        if (disposeOnCommit_ && error == 0) {
+            DisposeAndStop();
+            return;
+        }
+
+        if (stopOnCommit_) {
+            StopReactor();
+        }
+    }
+
+    void onConnect(const int32_t error) noexcept
+    {
+        connectCount_++;
+        lastConnectError_ = error;
+
+        if (peerConnected_ != nullptr && error == 0) {
+            peerConnected_->store(true);
+        }
+
+        if (error == 0 && secondConnectAddress_ != nullptr) {
+            const auto second = driver_->connect(*secondConnectAddress_);
+            secondConnectAttempted_ = true;
+            secondConnectOk_ = second.has_value();
+            if (!second) {
+                secondConnectError_ = second.error();
+            }
+        }
+
+        if (error != 0 && reconnectOnConnectError_ && reconnectAddress_ != nullptr) {
+            reconnectOnConnectError_ = false;
+            const auto again = driver_->connect(*reconnectAddress_);
+            reconnectAttempted_ = true;
+            reconnectOk_ = again.has_value();
+            if (!again) {
+                reconnectError_ = again.error();
+            }
+            return;
+        }
+
+        if (error == 0 && sendOnConnect_ != nullptr) {
+            const auto sent = driver_->send(*sendOnConnect_);
+            sendOnConnectAttempted_ = true;
+            sendOnConnectOk_ = sent.has_value();
+            if (!sent) {
+                sendOnConnectError_ = sent.error();
+            }
+            sendOnConnect_ = nullptr;
+        }
+
+        if (disposeOnConnect_ && error == 0) {
+            DisposeAndStop();
+            return;
+        }
+
+        if (scheduleDisposeOnConnectMs_ >= 0 && error == 0) {
+            ScheduleDispose(scheduleDisposeOnConnectMs_);
+            scheduleDisposeOnConnectMs_ = -1;
+            return;
+        }
+
+        if (error == 0 && sendOnConnectAttempted_ && sendOnConnectOk_
+            && !disposeOnConnect_ && !stopOnConnect_) {
+            return;
+        }
+
+        if (stopOnConnect_) {
+            StopReactor();
+        }
+    }
+
+    void onDisconnect(const int32_t error) noexcept
+    {
+        disconnectCount_++;
+        lastDisconnectError_ = error;
+
+        if (stopOnDisconnect_) {
+            StopReactor();
+        }
+    }
+
+    void onDisposed() noexcept
+    {
+        disposedCount_++;
+
+        if (reconnectOnDisposed_ && reconnectAddress_ != nullptr && disposedCount_ == 1) {
+            reconnectOnDisposed_ = false;
+            const auto again = driver_->connect(*reconnectAddress_);
+            reconnectAttempted_ = true;
+            reconnectOk_ = again.has_value();
+            if (!again) {
+                reconnectError_ = again.error();
+            }
+            return;
+        }
+
+        if (stopOnDisposed_) {
+            StopReactor();
+        }
+    }
+
+protected:
     void SetUp() override
     {
         ASSERT_TRUE(reactor_.initialize().has_value());
-
-        events_.onReadyRead = on_ready_read_callback_t::create<TCPSocketDriverIOCPTest,
-            &TCPSocketDriverIOCPTest::OnReadyRead>(*this);
-        events_.onCommit = on_commit_callback_t::create<TCPSocketDriverIOCPTest,
-            &TCPSocketDriverIOCPTest::OnCommit>(*this);
-        events_.onConnect = on_connect_callback_t::create<TCPSocketDriverIOCPTest,
-            &TCPSocketDriverIOCPTest::OnConnect>(*this);
-        events_.onDisconnect = on_disconnect_callback_t::create<TCPSocketDriverIOCPTest,
-            &TCPSocketDriverIOCPTest::OnDisconnect>(*this);
-        events_.onDisposed = on_disposed_callback_t::create<TCPSocketDriverIOCPTest,
-            &TCPSocketDriverIOCPTest::OnDisposed>(*this);
-
-        driver_.emplace(reactor_, events_);
+        driver_.emplace(reactor_, *this);
     }
 
     void TearDown() override
@@ -267,166 +404,10 @@ protected:
         return out.initialize("127.0.0.1", port).has_value();
     }
 
-    void OnReadyRead(socket_t fd) noexcept
+    void PrepareSend(send_operation_t& operation, uint8_t* data, const size_t len) noexcept
     {
-        readyReadCount_++;
-        lastReadyFd_ = fd;
-
-        if (captureReadyReadPayload_) {
-            capturedPayloadLen_ = 0;
-            while (capturedPayloadLen_ < static_cast<int>(sizeof(capturedPayload_))) {
-                const int n = ::recv(fd, capturedPayload_ + capturedPayloadLen_,
-                    static_cast<int>(sizeof(capturedPayload_)) - capturedPayloadLen_, 0);
-                if (n > 0) {
-                    capturedPayloadLen_ += n;
-                    continue;
-                }
-                break;
-            }
-        } else if (consumeReadyRead_) {
-            char buf[64];
-            while (::recv(fd, buf, sizeof(buf), 0) > 0) {
-            }
-        }
-
-        if (disposeAfterReadyReads_ > 0 && readyReadCount_ >= disposeAfterReadyReads_) {
-            DisposeAndStop();
-            return;
-        }
-
-        if (disposeOnReadyRead_) {
-            DisposeAndStop();
-            return;
-        }
-
-        if (stopOnReadyRead_) {
-            StopReactor();
-        }
-    }
-
-    void OnCommit(C_Reactor::operation_t& operation, const int32_t error) noexcept
-    {
-        commitCount_++;
-        lastCommitError_ = error;
-        lastCommitOperation_ = &operation;
-
-        if (sendOnCommit_ != nullptr && error == 0) {
-            auto* next = sendOnCommit_;
-            sendOnCommit_ = nullptr;
-            const auto again = driver_->send(*next);
-            chainedSendAttempted_ = true;
-            chainedSendOk_ = again.has_value();
-            if (!again) {
-                chainedSendError_ = again.error();
-            }
-            return;
-        }
-
-        if (disposeOnCommit_) {
-            DisposeAndStop();
-            return;
-        }
-
-        if (stopOnCommit_) {
-            StopReactor();
-        }
-    }
-
-    void OnConnect(const int32_t error) noexcept
-    {
-        connectCount_++;
-        lastConnectError_ = error;
-
-        if (peerConnected_ != nullptr && error == 0) {
-            peerConnected_->store(true);
-        }
-
-        if (error == 0 && secondConnectAddress_ != nullptr) {
-            const auto second = driver_->connect(*secondConnectAddress_);
-            secondConnectAttempted_ = true;
-            secondConnectOk_ = second.has_value();
-            if (!second) {
-                secondConnectError_ = second.error();
-            }
-        }
-
-        if (error != 0 && reconnectOnConnectError_ && reconnectAddress_ != nullptr) {
-            reconnectOnConnectError_ = false;
-            const auto again = driver_->connect(*reconnectAddress_);
-            reconnectAttempted_ = true;
-            reconnectOk_ = again.has_value();
-            if (!again) {
-                reconnectError_ = again.error();
-            }
-            return;
-        }
-
-        if (error == 0 && sendOnConnect_ != nullptr) {
-            const auto sent = driver_->send(*sendOnConnect_);
-            sendOnConnectAttempted_ = true;
-            sendOnConnectOk_ = sent.has_value();
-            if (!sent) {
-                sendOnConnectError_ = sent.error();
-            }
-            sendOnConnect_ = nullptr;
-        }
-
-        if (disposeOnConnect_ && error == 0) {
-            DisposeAndStop();
-            return;
-        }
-
-        if (scheduleDisposeOnConnectMs_ >= 0 && error == 0) {
-            ScheduleDispose(scheduleDisposeOnConnectMs_);
-            scheduleDisposeOnConnectMs_ = -1;
-            return;
-        }
-
-        if (scheduleSendOnConnectMs_ >= 0 && error == 0 && delayedSendOp_ != nullptr) {
-            ScheduleSend(*delayedSendOp_, scheduleSendOnConnectMs_);
-            scheduleSendOnConnectMs_ = -1;
-            delayedSendOp_ = nullptr;
-            return;
-        }
-
-        if (error == 0 && sendOnConnectAttempted_ && sendOnConnectOk_
-            && !disposeOnConnect_ && !stopOnConnect_) {
-            return;
-        }
-
-        if (stopOnConnect_) {
-            StopReactor();
-        }
-    }
-
-    void OnDisconnect(const int32_t error) noexcept
-    {
-        disconnectCount_++;
-        lastDisconnectError_ = error;
-
-        if (stopOnDisconnect_) {
-            StopReactor();
-        }
-    }
-
-    void OnDisposed() noexcept
-    {
-        disposedCount_++;
-
-        if (reconnectOnDisposed_ && reconnectAddress_ != nullptr && disposedCount_ == 1) {
-            reconnectOnDisposed_ = false;
-            const auto again = driver_->connect(*reconnectAddress_);
-            reconnectAttempted_ = true;
-            reconnectOk_ = again.has_value();
-            if (!again) {
-                reconnectError_ = again.error();
-            }
-            return;
-        }
-
-        if (stopOnDisposed_) {
-            StopReactor();
-        }
+        operation.content = etl::span<uint8_t>{data, len};
+        operation.transferred = 0;
     }
 
     void OnActionTimer() noexcept
@@ -434,36 +415,7 @@ protected:
         if (actionDispose_) {
             actionDispose_ = false;
             DisposeAndStop();
-            return;
         }
-
-        if (actionSend_ != nullptr) {
-            auto* op = actionSend_;
-            actionSend_ = nullptr;
-            const auto sent = driver_->send(*op);
-            delayedSendAttempted_ = true;
-            delayedSendOk_ = sent.has_value();
-            if (!sent) {
-                delayedSendError_ = sent.error();
-            }
-        }
-    }
-
-    void ScheduleSend(send_operation_t& operation, const int32_t delayMs)
-    {
-        actionSend_ = &operation;
-        actionTimer_.emplace(timer_callback_t::create<TCPSocketDriverIOCPTest,
-            &TCPSocketDriverIOCPTest::OnActionTimer>(*this));
-        auto deadline = clock_t::now();
-        deadline += etl::chrono::duration_cast<clock_t::duration>(etl::chrono::milliseconds(delayMs));
-        actionTimer_->arm(deadline);
-        reactor_.addTimer(*actionTimer_);
-    }
-
-    void PrepareSend(send_operation_t& operation, uint8_t* data, const size_t len) noexcept
-    {
-        operation.content = etl::span<uint8_t>{data, len};
-        operation.transferred = 0;
     }
 
     void OnTimeout() noexcept
@@ -473,8 +425,7 @@ protected:
     }
 
     C_Reactor reactor_{};
-    tcp_socket_driver_events_s events_{};
-    std::optional<C_TCPSocketDriverIOCP> driver_;
+    std::optional<Driver> driver_;
     std::optional<C_Timer> timeoutTimer_;
     std::optional<C_Timer> actionTimer_;
     std::atomic<bool>* peerConnected_{nullptr};
@@ -493,13 +444,10 @@ protected:
     int32_t reconnectError_{0};
     int32_t sendOnConnectError_{0};
     int32_t chainedSendError_{0};
-    int32_t delayedSendError_{0};
     socket_t lastReadyFd_{INVALID_SOCKET};
     C_Reactor::operation_t* lastCommitOperation_{nullptr};
     send_operation_t* sendOnConnect_{nullptr};
     send_operation_t* sendOnCommit_{nullptr};
-    send_operation_t* actionSend_{nullptr};
-    send_operation_t* delayedSendOp_{nullptr};
     bool timedOut_{false};
     bool secondConnectAttempted_{false};
     bool secondConnectOk_{false};
@@ -510,8 +458,6 @@ protected:
     bool sendOnConnectOk_{false};
     bool chainedSendAttempted_{false};
     bool chainedSendOk_{false};
-    bool delayedSendAttempted_{false};
-    bool delayedSendOk_{false};
 
     bool stopOnReadyRead_{false};
     bool stopOnConnect_{false};
@@ -527,7 +473,6 @@ protected:
     bool reconnectOnDisposed_{false};
     int disposeAfterReadyReads_{0};
     int scheduleDisposeOnConnectMs_{-1};
-    int scheduleSendOnConnectMs_{-1};
     char capturedPayload_[64]{};
     int capturedPayloadLen_{0};
 };
@@ -774,7 +719,6 @@ TEST_F(TCPSocketDriverIOCPTest, DisposeWhileConnectedInvokesOnDisposed)
     C_Address addr;
     ASSERT_TRUE(MakeAddress(listener.Port(), addr));
 
-    // Dispose after connect routine finishes and read-probe is armed.
     scheduleDisposeOnConnectMs_ = 10;
 
     std::thread acceptThread([&] {
@@ -1179,7 +1123,6 @@ TEST_F(TCPSocketDriverIOCPTest, DisposeDuringPendingSendInvokesOnDisposed)
     C_Address addr;
     ASSERT_TRUE(MakeAddress(listener.Port(), addr));
 
-    // Large-ish payload increases chance the send is still in-flight when dispose runs.
     std::vector<uint8_t> bytes(64 * 1024, static_cast<uint8_t>('Z'));
     send_operation_t op{};
     PrepareSend(op, bytes.data(), bytes.size());
@@ -1198,8 +1141,9 @@ TEST_F(TCPSocketDriverIOCPTest, DisposeDuringPendingSendInvokesOnDisposed)
     EXPECT_TRUE(sendOnConnectAttempted_);
     EXPECT_TRUE(sendOnConnectOk_);
     EXPECT_EQ(disposedCount_, 1);
-    // onCommit must not report success after explicit dispose mid-send.
-    EXPECT_EQ(commitCount_, 0);
+    // Cancelled/aborted send still delivers terminal onCommit so the user can free the op.
+    ASSERT_GE(commitCount_, 1);
+    EXPECT_NE(lastCommitError_, 0);
     EXPECT_EQ(disconnectCount_, 0);
 }
 

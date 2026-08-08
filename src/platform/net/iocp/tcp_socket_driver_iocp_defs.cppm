@@ -4,9 +4,7 @@
 module;
 #include <etl/span.h>
 
-export module net.tcp_socket_driver.iocp:defs;
-
-import reactor;
+export module net.tcp_socket_driver:defs_iocp;
 
 namespace etsl
 {
@@ -20,11 +18,5 @@ namespace etsl
         CONNECTING,
         CONNECTED,
         DISPOSING,
-    };
-
-    struct send_operation_s : C_Reactor::operation_t
-    {
-        etl::span<uint8_t> content;
-        uint32_t transferred;
     };
 }

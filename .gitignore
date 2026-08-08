@@ -4,5 +4,6 @@
 /.idea/
 /.vscode/
 /out/
+/.cache/
 *.exe
 *.pdb
