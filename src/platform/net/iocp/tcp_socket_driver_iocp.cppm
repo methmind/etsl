@@ -36,6 +36,8 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<void, int32_t> connect(const C_Address& addr) noexcept;
 
+        [[nodiscard]] etl::expected<uint32_t, int32_t> read(const etl::span<uint8_t>& content) noexcept;
+
         [[nodiscard]] etl::expected<void, int32_t> send(send_operation_t& operation) noexcept
         {
             return createSendOperation(operation);
@@ -83,8 +85,8 @@ export namespace etsl
 
     template<typename delegate_t>
     C_TCPSocketDriverIOCP<delegate_t>::C_TCPSocketDriverIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept :
-        reactor_(reactor), state_(tcp_socket_state_e::NONE), pendingOps_(0), wasConnected_(false),
-        cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
+        reactor_(reactor), fd_(INVALID_SOCKET_VALUE), state_(tcp_socket_state_e::NONE), pendingOps_(0),
+        wasConnected_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
     {
         static_assert(TCPDriverDelegate<delegate_t>, "Delegate must satisfy tcp driver delegate trait!");
 
@@ -114,6 +116,34 @@ export namespace etsl
         }
 
         return {};
+    }
+
+    template<typename delegate_t>
+    etl::expected<uint32_t, int32_t> C_TCPSocketDriverIOCP<delegate_t>::read(const etl::span<uint8_t>& content) noexcept
+    {
+        if (this->state_ != tcp_socket_state_e::CONNECTED) {
+            return etl::unexpected(WSAENOTCONN);
+        }
+
+        auto fail = [this](int32_t err) -> etl::expected<uint32_t, int32_t> {
+            beginTeardown(err);
+            return etl::unexpected(err);
+        };
+
+        const auto res = recv(this->fd_.get(), reinterpret_cast<char*>(content.data()), static_cast<int32_t>(content.size()), 0);
+        if (res > 0) {
+            return res;
+        }
+
+        if (res == 0) {
+            return fail(0);
+        }
+
+        if (const auto err = WSAGetLastError(); err != WSAEWOULDBLOCK) {
+            return fail(err);
+        }
+
+        return 0;
     }
 
     template<typename delegate_t>
@@ -277,17 +307,8 @@ export namespace etsl
     template<typename delegate_t>
     void C_TCPSocketDriverIOCP<delegate_t>::onReadRoutine() noexcept
     {
-        char peek = 0;
-        const auto peekRes = recv(this->fd_.get(), &peek, sizeof(peek), MSG_PEEK);
-        if (peekRes == 0) {
-            beginTeardown(0);
-            return;
-        }
-
-        if (peekRes > 0) {
-            this->delegate_.onReadyRead(this->fd_.get());
-        } else if (const auto err = WSAGetLastError(); err != WSAEWOULDBLOCK) {
-            beginTeardown(err);
+        this->delegate_.onReadyRead();
+        if (this->state_ != tcp_socket_state_e::CONNECTED) {
             return;
         }
 

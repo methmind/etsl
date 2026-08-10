@@ -6,15 +6,14 @@ module;
 
 module net.tcp_socket_driver:delegate;
 
-import socket.types;
 import :defs;
 
 namespace etsl
 {
     template<typename T>
-    concept TCPDriverDelegate = requires(T t, socket_t fd, send_operation_s& sendOperation, int32_t error)
+    concept TCPDriverDelegate = requires(T t, send_operation_s& sendOperation, int32_t error)
     {
-        { t.onReadyRead(fd) } noexcept -> std::same_as<void>;
+        { t.onReadyRead() } noexcept -> std::same_as<void>;
 
         { t.onCommit(sendOperation, error) } noexcept -> std::same_as<void>;
 

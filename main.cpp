@@ -21,10 +21,12 @@ public:
         return;
     }
 
-    void onReadyRead(etsl::socket_t fd) noexcept
+    void onReadyRead() noexcept
     {
         char test[261]{};
-        recv(fd, test, 260, 0);
+        if (const auto err = this->driver_.read({(uint8_t*)&test, sizeof(test)}); !err) {
+            return;
+        }
 
         this->sendOperation_.content = { (uint8_t*)hello_world, strlen(hello_world) };
         if (const auto err = this->driver_.send(this->sendOperation_); !err) {
@@ -69,7 +71,7 @@ int main()
     }
 
     etsl::C_Address address;
-    if (const auto err = address.initialize("213.149.6.153", 3730); !err) {
+    if (const auto err = address.initialize("127.0.0.1", 3730); !err) {
         return err.error();
     }
 

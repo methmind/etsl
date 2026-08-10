@@ -8,6 +8,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
 #include <optional>
 #include <thread>
@@ -177,32 +178,38 @@ class TCPSocketDriverIOCPTest : public ::testing::Test
 public:
     using clock_t = etsl::clock_t;
     using timer_callback_t = etsl::timer_callback_t;
-    using socket_t = etsl::socket_t;
     using C_Address = etsl::C_Address;
     using C_Reactor = etsl::C_Reactor;
     using C_Timer = etsl::C_Timer;
     using send_operation_t = etsl::send_operation_t;
     using Driver = etsl::C_TCPSocketDriver<TCPSocketDriverIOCPTest>;
 
-    void onReadyRead(socket_t fd) noexcept
+    void onReadyRead() noexcept
     {
         readyReadCount_++;
-        lastReadyFd_ = fd;
 
         if (captureReadyReadPayload_) {
             capturedPayloadLen_ = 0;
             while (capturedPayloadLen_ < static_cast<int>(sizeof(capturedPayload_))) {
-                const int n = ::recv(fd, capturedPayload_ + capturedPayloadLen_,
-                    static_cast<int>(sizeof(capturedPayload_)) - capturedPayloadLen_, 0);
-                if (n > 0) {
-                    capturedPayloadLen_ += n;
-                    continue;
+                // value_or: avoid etl::expected<uint32_t>::operator* (broken under -fno-exceptions).
+                constexpr uint32_t kReadFailed = UINT32_MAX;
+                const uint32_t n = driver_->read({
+                    reinterpret_cast<uint8_t*>(capturedPayload_ + capturedPayloadLen_),
+                    static_cast<size_t>(sizeof(capturedPayload_) - capturedPayloadLen_)
+                }).value_or(kReadFailed);
+                if (n == kReadFailed || n == 0) {
+                    break;
                 }
-                break;
+                capturedPayloadLen_ += static_cast<int>(n);
             }
         } else if (consumeReadyRead_) {
-            char buf[64];
-            while (::recv(fd, buf, sizeof(buf), 0) > 0) {
+            uint8_t buf[64];
+            constexpr uint32_t kReadFailed = UINT32_MAX;
+            while (true) {
+                const uint32_t n = driver_->read({buf, sizeof(buf)}).value_or(kReadFailed);
+                if (n == kReadFailed || n == 0) {
+                    break;
+                }
             }
         }
 
@@ -444,7 +451,6 @@ protected:
     int32_t reconnectError_{0};
     int32_t sendOnConnectError_{0};
     int32_t chainedSendError_{0};
-    socket_t lastReadyFd_{INVALID_SOCKET};
     C_Reactor::operation_t* lastCommitOperation_{nullptr};
     send_operation_t* sendOnConnect_{nullptr};
     send_operation_t* sendOnCommit_{nullptr};
@@ -771,7 +777,6 @@ TEST_F(TCPSocketDriverIOCPTest, PeerDataInvokesOnReadyRead)
     ASSERT_EQ(connectCount_, 1);
     EXPECT_EQ(lastConnectError_, 0);
     EXPECT_GE(readyReadCount_, 1);
-    EXPECT_NE(lastReadyFd_, INVALID_SOCKET);
     EXPECT_EQ(disposedCount_, 1);
 }
 
@@ -862,6 +867,8 @@ TEST_F(TCPSocketDriverIOCPTest, PeerGracefulCloseInvokesOnDisconnect)
 
     std::atomic<bool> connected{false};
     peerConnected_ = &connected;
+    // EOF is observed only via driver.read(); that starts teardown → onDisconnect(0).
+    consumeReadyRead_ = true;
     stopOnDisconnect_ = true;
 
     std::thread peerThread([&] {
@@ -898,6 +905,7 @@ TEST_F(TCPSocketDriverIOCPTest, PeerAbortiveCloseInvokesOnDisconnectWithError)
 
     std::atomic<bool> connected{false};
     peerConnected_ = &connected;
+    consumeReadyRead_ = true;
     stopOnDisconnect_ = true;
 
     std::thread peerThread([&] {
@@ -996,6 +1004,14 @@ TEST_F(TCPSocketDriverIOCPTest, ExplicitDisposeAfterReadyReadDoesNotEmitDisconne
     EXPECT_GE(readyReadCount_, 1);
     EXPECT_EQ(disposedCount_, 1);
     EXPECT_EQ(disconnectCount_, 0);
+}
+
+TEST_F(TCPSocketDriverIOCPTest, ReadBeforeConnectReturnsNotConn)
+{
+    uint8_t bytes[8]{};
+    const auto result = driver_->read({bytes, sizeof(bytes)});
+    ASSERT_FALSE(result.has_value());
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAENOTCONN));
 }
 
 TEST_F(TCPSocketDriverIOCPTest, SendBeforeConnectReturnsInvalid)
