@@ -4,12 +4,11 @@
 module;
 #include <concepts>
 
-#include "etl/expected.h"
+#include <etl/expected.h>
 
-export module reactor.trait;
+export module reactor:trait;
 
-import socket.types;
-
+import net;
 import timer;
 
 export namespace etsl

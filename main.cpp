@@ -2,9 +2,8 @@
 #include <winsock2.h>
 
 import reactor;
+import net;
 import net.tcp_socket_driver;
-import socket.address;
-import socket.types;
 
 const char* hello_world = "Hello, Server!\r\n";
 
@@ -28,8 +27,8 @@ public:
             return;
         }
 
-        this->sendOperation_.content = { (uint8_t*)hello_world, strlen(hello_world) };
-        if (const auto err = this->driver_.send(this->sendOperation_); !err) {
+        if (const auto err = this->driver_.send({(uint8_t*)hello_world, strlen(hello_world)},
+            this->sendOperation_); !err) {
             return;
         }
 
@@ -71,7 +70,7 @@ int main()
     }
 
     etsl::C_Address address;
-    if (const auto err = address.initialize("127.0.0.1", 3730); !err) {
+    if (const auto err = address.initialize("213.149.6.153", 3730); !err) {
         return err.error();
     }
 

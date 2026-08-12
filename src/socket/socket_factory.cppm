@@ -6,9 +6,10 @@ module;
 
 #include "etl/expected.h"
 
-export module socket.factory;
-import socket.raii;
-import socket.types;
+export module socket:factory;
+
+import net;
+import :raii;
 
 export namespace etsl
 {

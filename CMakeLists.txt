@@ -44,30 +44,29 @@ target_sources(etsl_core
         src/reactor/reactor_trait.cppm
         src/reactor/iocp/reactor_iocp.cppm
         src/reactor/iocp/reactor_iocp_defs.cppm
-        src/platform/net/tcp_socket_driver.cppm
-        src/platform/net/tcp_socket_driver_types.cppm
-        src/platform/net/iocp/tcp_socket_driver_iocp_defs.cppm
-        src/platform/net/iocp/tcp_socket_driver_iocp.cppm
+        src/platform/net/tcp/tcp_socket_driver.cppm
+        src/platform/net/tcp/tcp_socket_driver_defs.cppm
+        src/platform/net/tcp/iocp/tcp_socket_driver_iocp_defs.cppm
+        src/platform/net/tcp/iocp/tcp_socket_driver_iocp.cppm
         src/socket/socket_factory.cppm
         src/socket/socket_raii.cppm
-        src/socket/socket_independent.cppm
-        src/win/wsa_initializer.cppm
-        src/core/socket_types.cppm
+        src/platform/wsa/wsa_initializer.cppm
         src/timer/timer_bucket.cppm
         src/timer/timer.cppm
         src/timer/timer_types.cppm
-        src/platform/net_types.cppm
-        src/platform/net_ops.cppm
-        src/socket/socket_address.cppm
-        src/platform/net/tcp_socket_driver_delegate_trait.cppm
+        src/platform/net/net_defs.cppm
+        src/platform/net/net_ops.cppm
+        src/platform/net/net_address.cppm
+        src/platform/net/tcp/tcp_socket_driver_delegate_trait.cppm
+        src/platform/net/net.cppm
+        src/socket/socket.cppm
     PRIVATE
         src/reactor/iocp/reactor_iocp.cpp
-        src/win/wsa_initializer.cpp
-        src/socket/socket_independent.cpp
+        src/platform/wsa/wsa_initializer.cpp
         src/timer/timer_bucket.cpp
-        src/platform/etl_chrono.cpp
-        src/platform/net_ops.cpp
-        src/socket/socket_address.cpp
+        src/platform/util/etl_chrono.cpp
+        src/platform/net/net_ops.cpp
+        src/platform/net/net_address.cpp
 )
 
 target_include_directories(etsl_core PUBLIC
@@ -106,10 +105,10 @@ endif()
 
 #if(WIN32)
     add_custom_command(TARGET etsl POST_BUILD
-        COMMAND ssh -i $ENV{HOME}/.ssh/win-dev
+        COMMAND ssh -i $ENV{HOME}/.ssh/wsa-dev
             sexey@192.168.122.51
             "cmd /c \"taskkill /IM gdbserver.exe /F >nul 2>&1 || exit /b 0\""
-        COMMAND scp -i $ENV{HOME}/.ssh/win-dev
+        COMMAND scp -i $ENV{HOME}/.ssh/wsa-dev
             $<TARGET_FILE:etsl>
             sexey@192.168.122.51:C:/dev/etsl.exe
         COMMENT "Deploying etsl.exe"

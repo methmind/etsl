@@ -7,8 +7,9 @@ module;
 
 #include "etl/expected.h"
 
-module reactor.iocp;
+module reactor;
 
+import :iocp;
 import win.wsa;
 
 namespace etsl

@@ -2,15 +2,14 @@
 // Created by sexey on 23.05.2026.
 //
 module;
-#include <winsock2.h>
 #include <windows.h>
 #include <etl/expected.h>
 #include <etl/intrusive_list.h>
 
-export module reactor.iocp;
+export module reactor:iocp;
 
-import socket.types;
-import :defs;
+import net;
+import :iocp_defs;
 
 import timer;
 import timer.bucket;

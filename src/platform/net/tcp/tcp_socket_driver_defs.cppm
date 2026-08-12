@@ -12,7 +12,7 @@ export namespace etsl
 {
     struct send_operation_s : C_Reactor::operation_t
     {
-        etl::span<uint8_t> content;
+        etl::span<const uint8_t> content;
         uint32_t transferred;
     };
 

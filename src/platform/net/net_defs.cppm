@@ -10,7 +10,8 @@ module;
 #else
 #error "Unsupported platform"
 #endif
-export module net.types;
+
+export module net:defs;
 
 export namespace etsl
 {
@@ -19,4 +20,20 @@ export namespace etsl
     using os_sockaddr_in_t = sockaddr_in;
 
     using os_sockaddr = sockaddr;
+
+#if defined(_WIN32)
+#undef INVALID_SOCKET
+#undef SOCKET_ERROR
+    using socket_t = SOCKET;
+
+    constexpr socket_t INVALID_SOCKET = ~0;
+
+    constexpr auto SOCKET_ERROR = -1;
+#elif defined(__linux__)
+    using socket_t = int;
+
+    constexpr socket_t INVALID_SOCKET = -1;
+
+    constexpr auto SOCKET_ERROR = -1;
+#endif
 }

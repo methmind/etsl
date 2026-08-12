@@ -12,10 +12,9 @@ module;
 export module net.tcp_socket_driver:iocp;
 
 import reactor;
-import socket.types;
-import socket.raii;
-import socket.address;
-import socket.factory;
+import net;
+import socket;
+
 import :defs;
 import :delegate;
 import :defs_iocp;
@@ -38,8 +37,9 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<uint32_t, int32_t> read(const etl::span<uint8_t>& content) noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> send(send_operation_t& operation) noexcept
+        [[nodiscard]] etl::expected<void, int32_t> send(const etl::span<const uint8_t>& content, send_operation_t& operation) noexcept
         {
+            operation.content = content;
             return createSendOperation(operation);
         }
 
@@ -85,7 +85,7 @@ export namespace etsl
 
     template<typename delegate_t>
     C_TCPSocketDriverIOCP<delegate_t>::C_TCPSocketDriverIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept :
-        reactor_(reactor), fd_(INVALID_SOCKET_VALUE), state_(tcp_socket_state_e::NONE), pendingOps_(0),
+        reactor_(reactor), fd_(INVALID_SOCKET), state_(tcp_socket_state_e::NONE), pendingOps_(0),
         wasConnected_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
     {
         static_assert(TCPDriverDelegate<delegate_t>, "Delegate must satisfy tcp driver delegate trait!");
@@ -167,9 +167,10 @@ export namespace etsl
     {
         DWORD bytes = 0;
         GUID fnGUID = WSAID_CONNECTEX;
+
         LPFN_CONNECTEX fnPtr = nullptr;
-        if (WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &fnGUID, sizeof(fnGUID), &fnPtr, sizeof(fnPtr),
-            &bytes, nullptr, nullptr) != ERROR_SUCCESS) {
+        if (WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &fnGUID, sizeof(fnGUID),
+            &fnPtr, sizeof(fnPtr), &bytes, nullptr, nullptr) != ERROR_SUCCESS) {
             return etl::unexpected(WSAGetLastError());
         }
 
@@ -251,7 +252,7 @@ export namespace etsl
 
         WSABUF buffer = {
             .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
-            .buf = reinterpret_cast<char*>(operation.content.data() + operation.transferred),
+            .buf = reinterpret_cast<char*>(const_cast<uint8_t*>(operation.content.data() + operation.transferred)),
         };
 
         if (WSASend(this->fd_.get(), &buffer, 1, nullptr, 0, &operation, nullptr) != ERROR_SUCCESS) {
@@ -368,10 +369,12 @@ export namespace etsl
 
         auto& sendOperation = reinterpret_cast<send_operation_t&>(operation);
         sendOperation.transferred += transferred;
+
         if (sendOperation.transferred < sendOperation.content.size()) {
             if (const auto err = createSendOperation(sendOperation); !err) {
                 finalize(err.error());
             }
+
             return;
         }
 

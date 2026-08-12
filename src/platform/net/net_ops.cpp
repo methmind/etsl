@@ -12,7 +12,10 @@ module;
 #else
 #error "Unsupported platform"
 #endif
-module net.ops;
+
+module net;
+
+import :ops;
 
 namespace etsl
 {
@@ -27,5 +30,15 @@ namespace etsl
         }
 
         return sizeof(os_sockaddr_in_t);
+    }
+
+    bool CloseSocket(socket_t fd) noexcept
+    {
+        return closesocket(fd) != SOCKET_ERROR;
+    }
+
+    bool Shutdown(socket_t fd, socket_shutdown_e mode) noexcept
+    {
+        return shutdown(fd, static_cast<int32_t>(mode)) != SOCKET_ERROR;
     }
 }

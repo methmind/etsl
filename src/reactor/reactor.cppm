@@ -5,10 +5,10 @@ module;
 
 export module reactor;
 
-import reactor.trait;
+import :trait;
 
 #if defined(_WIN32)
-import reactor.iocp;
+import :iocp;
 export namespace etsl { using C_Reactor = C_ReactorIOCP; }
 #elif defined(__linux__)
 #error "Linux reactor is not implemented yet"

@@ -4,9 +4,9 @@
 module;
 #include <etl/expected.h>
 
-export module socket.address;
+export module net:address;
 
-import net.types;
+import :defs;
 
 export namespace etsl
 {

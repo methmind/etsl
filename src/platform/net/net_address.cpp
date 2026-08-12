@@ -4,9 +4,10 @@
 module;
 #include <etl/expected.h>
 
-module socket.address;
+module net;
 
-import net.ops;
+import :address;
+import :ops;
 
 namespace etsl
 {

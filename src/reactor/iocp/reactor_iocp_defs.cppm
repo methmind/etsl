@@ -10,7 +10,7 @@ module;
 
 #include <util/noncopyable.h>
 
-export module reactor.iocp:defs;
+export module reactor:iocp_defs;
 
 namespace etsl
 {

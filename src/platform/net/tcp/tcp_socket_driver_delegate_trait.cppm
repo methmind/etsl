@@ -11,7 +11,7 @@ import :defs;
 namespace etsl
 {
     template<typename T>
-    concept TCPDriverDelegate = requires(T t, send_operation_s& sendOperation, int32_t error)
+    concept TCPDriverDelegate = requires(T t, send_operation_t& sendOperation, int32_t error)
     {
         { t.onReadyRead() } noexcept -> std::same_as<void>;
 
