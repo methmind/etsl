@@ -70,7 +70,7 @@ int main()
     }
 
     etsl::C_Address address;
-    if (const auto err = address.initialize("213.149.6.153", 3730); !err) {
+    if (const auto err = address.initialize("127.0.0.1", 3730); !err) {
         return err.error();
     }
 
