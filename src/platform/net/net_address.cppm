@@ -20,10 +20,10 @@ export namespace etsl
 
         [[nodiscard]] const os_sockaddr& data() const noexcept { return reinterpret_cast<const os_sockaddr&>(this->storage_); }
 
-        [[nodiscard]] size_t size() const noexcept { return this->size_; }
+        [[nodiscard]] uint32_t size() const noexcept { return this->size_; }
 
     private:
-        size_t size_{};
+        uint32_t size_{};
         os_sockaddr_storage_t storage_{};
     };
 }

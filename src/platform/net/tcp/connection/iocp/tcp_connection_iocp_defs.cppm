@@ -4,7 +4,7 @@
 module;
 #include <etl/span.h>
 
-export module net.tcp_socket_driver:defs_iocp;
+export module net.tcp_connection:defs_iocp;
 
 namespace etsl
 {
@@ -12,7 +12,7 @@ namespace etsl
 
     constexpr int32_t INVALID_CACHE_VALUE = 0xBADC0DE;
 
-    enum class tcp_socket_state_e : uint8_t
+    enum class tcp_connection_state_e : uint8_t
     {
         NONE,
         CONNECTING,

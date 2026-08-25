@@ -4,7 +4,7 @@
 module;
 #include <etl/span.h>
 
-export module net.tcp_socket_driver:defs;
+export module net.tcp_connection:defs;
 
 import reactor;
 

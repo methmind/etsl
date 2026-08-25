@@ -1,9 +1,13 @@
 #include <cstdint>
 #include <winsock2.h>
+#include <etl/pool.h>
+
+#include "etl/expected.h"
 
 import reactor;
 import net;
-import net.tcp_socket_driver;
+import net.tcp_connection;
+import net.tcp_acceptor;
 
 const char* hello_world = "Hello, Server!\r\n";
 
@@ -57,19 +61,35 @@ public:
 
 private:
     etsl::C_Reactor& reactor_;
-    etsl::C_TCPSocketDriver<C_Test> driver_;
+    etsl::C_TCPConnection<C_Test> driver_;
 
     etsl::send_operation_t sendOperation_{};
 };
 
 int main()
 {
+    etl::pool<etsl::accept_operation_s, 32> backpressurePool;
+
     etsl::C_Reactor reactor;
     if (const auto err = reactor.initialize(); !err) {
         return err.error();
     }
 
-    etsl::C_Address address;
+    etsl::C_Address gateAddr;
+    if (const auto err = gateAddr.initialize("0.0.0.0", 3730); !err) {
+        return err.error();
+    }
+
+    etsl::C_TCPAcceptor acceptor(reactor);
+    if (const auto err = acceptor.initialize(gateAddr); !err) {
+        return err.error();
+    }
+
+    if (const auto err = acceptor.listen(SOMAXCONN); !err) {
+        return err.error();
+    }
+
+    /*etsl::C_Address address;
     if (const auto err = address.initialize("127.0.0.1", 3730); !err) {
         return err.error();
     }
@@ -77,7 +97,7 @@ int main()
     C_Test test(reactor);
     if (const auto err = test.exec(address); !err) {
         return err.error();
-    }
+    }*/
 
     reactor.run();
     return 0;

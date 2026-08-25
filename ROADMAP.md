@@ -16,12 +16,16 @@
 
 **etsl** — сокетная библиотека для сборки в **минимальный бинарный размер**.
 
-- Реактивная модель (reactor), события доставляются колбэками.
+- Реактивная модель (reactor), события доставляются колбэками делегата.
 - Windows — первая платформа (IOCP), Linux (epoll) — вторая. Код пользователя
   платформенно-нейтрален: «написал один раз — работает везде».
 - Прообраз API — сокеты Qt (`QAbstractSocket`/`QTcpSocket`/`QTcpServer`),
-  но **только async-часть** (никаких `waitFor*`).
-- IOCP приводится к реактивному (readiness) режиму трюком с **0-byte WSARecv**.
+  но **только async-часть** (никаких `waitFor*`); эволюционировал в делегатную
+  модель без event-enum (ADR-3).
+- **Полу-проактивная модель I/O** (ADR-2): чтение — проактивная 0-byte
+  `WSARecv`-проба + синхронный `read()` в колбэке; запись — полностью
+  проактивные `WSASend` с caller-owned операциями. Идея эмуляции readiness
+  таймерами отвергнута.
 - Основа: ETL (Embedded Template Library), C++20 modules, `noexcept`-дисциплина.
 
 Нефункциональные требования:
@@ -30,15 +34,23 @@
 2. Библиотека не выполняет heap-аллокаций сама; объекты создаёт владелец
    (стек/статик/пул пользователя).
 3. Без исключений и RTTI в коде библиотеки.
-4. Платформенный код — только в явно выделенных слоях; в `tcp_socket` ноль `#ifdef`.
+4. ОС-специфичный код — только в партициях `<feature>/<os>/` и ос-шинах;
+   контракты (defs/delegate/alias) не содержат вызовов ОС (ADR-10).
 
 ---
 
-## 2. Окружение и сборка (проверено 2026-07-18)
+## 2. Окружение и сборка (обновлено 2026-08-20)
 
-- Тулчейн рабочий: **clang (MSYS2 mingw64) + Ninja**, каталог `cmake-build-debug-clang/`.
-  Сборка зелёная. Debug exe ≈ 336 КБ (это НЕ baseline; baseline снимается на
-  MinSizeRel в Этапе 0).
+- Основной режим — **кросс-компиляция из Linux под Windows**: toolchain
+  `~/Документы/toolchain/windows-clang.cmake` (clang, target
+  `x86_64-pc-windows-msvc`, Windows SDK в `~/winsdk`), каталог сборки
+  `cmake-build-debug-clang-windows/` (Ninja). Пресеты `clang-debug`/
+  `clang-minsize` из `CMakePresets.json` рассчитаны на MSYS2-окружение и
+  в Linux-кросс-сборке не используются.
+- Запуск и отладка — Windows-ВМ `win-dev` (192.168.122.51, ключ
+  `~/.ssh/win-dev`); POST_BUILD-хук таргета `etsl` деплоит exe по SSH/scp.
+  Известный дефект сборки: хук ссылается на ключ `~/.ssh/wsa-dev`, которого
+  нет, — деплой падает до ручной правки пути.
 - MSVC (`cl`) **не поддерживается** и не планируется; проект ориентирован
   исключительно на Clang.
 - ETL 20.47.1 (`external/etl`, submodule). Исключения внутри ETL выключены по
@@ -47,11 +59,18 @@
   без исключений.
 - CMake ≥ 4.2, `CMAKE_CXX_SCAN_FOR_MODULES ON`. Модули перечислены в
   `FILE_SET CXX_MODULES` в `CMakeLists.txt` — **каждый новый модуль добавлять туда**.
+- **Тесты:** GoogleTest v1.17.0 (FetchContent), опция `ETSL_BUILD_TESTS`; набор
+  `test/tcp_connection_iocp_test.cpp` — 30 тестов, Windows/IOCP-only (на
+  не-Windows сборка suite отключена). Из-за `CMAKE_CROSSCOMPILING` тест
+  регистрируется одним `add_test` без `gtest_discover_tests`; прогон —
+  скопировать exe на ВМ и запустить.
 
 Команды:
 
 ```bash
-cmake --build cmake-build-debug-clang        # рабочая сборка
+ninja -C cmake-build-debug-clang-windows tcp_connection_iocp_test  # тесты
+ninja -C cmake-build-debug-clang-windows etsl                          # exe + deploy-хук
+ninja -C cmake-build-minsize-clang-windows etsl size-report            # замер ADR-9
 ```
 
 ---
@@ -61,77 +80,114 @@ cmake --build cmake-build-debug-clang        # рабочая сборка
 Формат: решение → почему → что отвергнуто. Эти решения финальны, если явно не
 пересмотрены с записью здесь.
 
-### ADR-1. Платформенные границы — `reactor/impl` и `platform`, не `socket`
+### ADR-1. Платформенные границы — `reactor/<platform>` и `platform`, не `socket`
 
-`reactor/impl/<platform>` содержит только demultiplexer/completion backend.
-Transport-specific OS operations находятся в `platform/net/<platform>`;
-`platform/net/tcp_driver.cppm` выбирает реализацию alias-ом. `tcp_socket`
-пишется один раз без `#ifdef` и зависит от общего driver contract.
-Platform TCP driver использует reactor для association/completion, но reactor
-не зависит от driver. Размещение platform driver в `reactor` или `socket`
-запрещено.
+> **Пересмотрено 25.08.2026 (ADR-10):** каталог `platform/` ликвидируется;
+> структурные границы переопределены как фича-партиции `<feature>/<os>/`.
+> Ниже — историческая запись прежней политики (пути `platform/net/tcp/…`
+> после задачи 2.7 читать как `net/tcp/…`).
 
-### ADR-2. Эмуляция readiness поверх IOCP
+`reactor/<platform>` (фактически `reactor/iocp/`) содержит только
+demultiplexer/completion backend. Transport-specific OS operations находятся в
+`platform/net/tcp/<platform>`; `platform/net/tcp/tcp_connection.cppm`
+выбирает реализацию alias-ом (`C_TCPConnection<T>` = IOCP-реализация).
+Отдельный generic `tcp_socket`-слой поверх соединения отсутствует:
+пользовательский делегат удовлетворяет `TCPConnectionDelegate` (ADR-3) и сам по
+себе платформенно-нейтрален. Platform TCP connection использует reactor для
+association/completion, но reactor не зависит от connection. Размещение
+platform connection в `reactor` или `socket` запрещено.
 
-- **Чтение:** на сокет взводится ровно один pending **0-byte `WSARecv`**. Его
-  completion всегда имеет `bytesTransferred == 0` (данные не копируются), поэтому
-  «данные пришли» и «peer закрыл соединение» из completion неотличимы. После
-  completion делается неблокирующий `recv(buf, 1, MSG_PEEK)`:
-  `> 0` → событие `EV_READ`; `0` → `EV_CLOSED`; `WSAEWOULDBLOCK` → ложное
-  срабатывание → перевзвести. Level-triggered: после возврата обработчика проба
-  взводится заново — если пользователь не вычитал всё, событие повторится
-  (пейсинг естественный, через async completion, busy loop невозможен).
-- **Запись (пересмотрено 23.07.2026):** **0-byte `WSASend` НЕ работает** — он
-  завершается немедленно и не сигнализирует записываемость. На IOCP используется
-  proactive `WSASend`; partial/completion обрабатывает TCP driver. На epoll
-  driver продолжает `send` по `EPOLLOUT`. Общий `tcp_socket` держит FIFO
-  caller-owned `C_TcpWriteRequest`, но одновременно pending только одна kernel
-  write. Timer backoff и внутренний TX ring buffer исключены из write-path.
+### ADR-2. Полу-проактивная модель I/O (пересмотрено 2026-08-20)
+
+Идея приводить IOCP к чисто реактивному (readiness) режиму отвергнута, как и
+эмуляция readiness таймерами. Принята полу-проактивная модель:
+
+- **Чтение:** на сокет взводится ровно один pending **0-byte `WSARecv`**
+  (read-probe). Его completion означает «данные доступны» и транслируется в
+  `onReadyRead()`. Пользователь читает синхронно из колбэка: `read(span)` →
+  `recv`; `WSAEWOULDBLOCK` → возвращается 0 (вычитано всё); `0` → EOF →
+  teardown → `onDisconnect(0)`. После возврата `onReadyRead()` проба взводится
+  заново — level-triggered семантика, пейсинг через async completion, busy loop
+  невозможен. `MSG_PEEK`-фильтрация удалена: на IOCP probe срабатывает на
+  реальный приём, EOF детектится через `read() == 0`.
+- **Запись (полностью проактивная):** `send(span, send_operation_t&)` немедленно
+  порождает `WSASend`; частичные завершения соединение дозавершает сам
+  (`transferred +=`, досылка остатка). Каждая операция — caller-owned контекст
+  `send_operation_t` (наследует `operation_t`/`WSAOVERLAPPED`); параллельно
+  допустимо произвольное число операций, каждая завершается ровно одним
+  терминальным `onCommit(operation, error)`. Порядок доставки гарантирует TCP
+  (порядок вызовов `WSASend` на сокете). FIFO, TX ring buffer и timer backoff
+  в соединении отсутствуют — очередь операций при необходимости держит
+  пользователь. На epoll write продолжается по `EPOLLOUT` (Этап 4).
 - **Accept/Connect:** эмуляция не нужна — `AcceptEx`/`ConnectEx` нативно
-  completion-based; их завершение мапится прямо в `onIncoming`/`onConnected`.
+  completion-based; их завершение мапится прямо в `onIncoming`/`onConnect`.
 - **Контракт association:** generic reactor только связывает fd с backend.
   Взвод connect/read/write и обязательный nonblocking mode — ответственность
-  platform TCP driver/socket factory.
-- **Отвергнуто:** `WSAEventSelect` + `WSAWaitForMultipleEvents` (лимит 64 handle
-  на ожидание, лишний поток); AFD poll в стиле wepoll (недокументированный API).
+  platform TCP connection/socket factory.
+- **Отвергнуто:** эмуляция readiness таймерами (таймеры реактора — только
+  пользовательские задачи: connect timeout, периодика); `MSG_PEEK` после probe;
+  0-byte `WSASend` (завершается немедленно, writability не сигнализирует);
+  `WSAEventSelect` + `WSAWaitForMultipleEvents` (лимит 64 handle на ожидание,
+  лишний поток); AFD poll в стиле wepoll (недокументированный API).
 
-### ADR-3. Диспетчеризация — `etl::delegate`
+### ADR-3. Диспетчеризация — `etl::delegate` + делегат соединения
 
 ```cpp
 // Реактор не знает тип операции.
 struct operation_iocp_s : WSAOVERLAPPED {
-    etl::delegate<void(uint32_t bytes, int32_t error)> callback;
+    etl::delegate<void(operation_iocp_s& operation, uint32_t bytes, int32_t error)> callback;
 };
 ```
 
-IOCP reactor доставляет raw completion делегату операции. TCP driver переводит
-его в `CONNECTED/READ_READY/CLOSED/IO_ERROR/DISPOSED`; socket wrapper статически
-вызывает handler. Валидный callback одновременно обозначает in-flight
-operation; reactor очищает его перед вызовом, отдельного `pending` flag нет.
-Виртуальных иерархий и heap type-erasure нет.
+IOCP reactor доставляет raw completion делегату операции. Generic-слоя
+`tcp_socket` с event-enum (`EV_*`) больше нет: platform connection
+`C_TCPConnectionIOCP<T>` вызывает методы делегата пользователя напрямую.
+Контракт проверяется концептом `TCPConnectionDelegate` (`static_assert` в
+конструкторе соединения):
+
+- `onConnect(int32_t error)` — завершение `ConnectEx` (или неудачный коннект
+  после teardown);
+- `onReadyRead()` — данные доступны; пользователь зовёт `read(span)`;
+- `onCommit(operation_t&, int32_t error)` — терминальное завершение
+  send-операции, включая отменённую (`ERROR_OPERATION_ABORTED` при dispose —
+  сигнал освобождать контекст);
+- `onDisconnect(int32_t error)` — разрыв после установленного соединения
+  (EOF/RST; error == 0 при graceful);
+- `onDisposed()` — teardown завершён после явного `dispose()`.
+
+Валидный callback одновременно обозначает in-flight operation; reactor очищает
+его перед вызовом, отдельного `pending` flag нет. Виртуальных иерархий и heap
+type-erasure нет.
 
 ### ADR-4. Владение памятью — библиотека не аллоцирует
 
-- Event loop — value type на стеке: `C_EventLoop loop; loop.initialize(); loop.run();`
+- Event loop (reactor) — value type на стеке: `C_Reactor loop; loop.initialize(); loop.run();`
   **Отвергнуто:** `etl::pool` + `createLoop()` + `unique_ptr` (машинерия без
   выигрыша — цикл создаётся один раз).
-- IOCP operation (содержит `WSAOVERLAPPED`) — член platform driver; reactor
+- IOCP operation (содержит `WSAOVERLAPPED`) — член platform connection; reactor
   хранит указатель только до completion.
-- Write payload и `C_TcpWriteRequest` принадлежат пользователю и живут до
-  единого completion callback. Request — переиспользуемый стабильный slot;
-  payload/context/callback задаются при каждом `write`. Requests стоят в
-  intrusive FIFO без аллокаций.
+- Write payload и `send_operation_t` принадлежат пользователю и живут до
+  единственного терминального `onCommit`; переиспользование или разрушение
+  контекста до завершения запрещено (соединение пишет в его `WSAOVERLAPPED`).
+  Соединение не ведёт очередей: пользователь может держать несколько независимых
+  операций одновременно (ADR-2), аллокаций нет.
 
-### ADR-5. Лайфтайм OVERLAPPED (классическая ловушка IOCP)
+### ADR-5. Лайфтайм OVERLAPPED и teardown (обновлено 2026-08-20)
 
-`WSAOVERLAPPED` обязан жить до завершения операции. IOCP TCP driver содержит
-две стабильные операции: control (`ConnectEx` или read-probe) и write
-(`WSASend`). `close()` заменяет callbacks активных операций на direction-specific
-cancellation callbacks, вызывает `CancelIoEx` и считает completions; write path
-сохраняет результат уже queued completion, а `ERROR_OPERATION_ABORTED`
-означает фактическую отмену. Последний callback выдаёт `DISPOSED`.
-Normal I/O paths teardown не проверяют.
-Уничтожение объекта раньше запрещено.
+`WSAOVERLAPPED` обязан жить до завершения операции. Соединение хранит стабильные
+`readinessOperation_` (ConnectEx/read-probe) и `disposeOperation_`;
+send-операции — caller-owned (`send_operation_t`). Счётчик `pendingOps_`
+отслеживает активные операции. Teardown — единый путь `beginTeardown(reason)`:
+RAII-закрытие сокета (`C_Socket::dispose()` → `closesocket`) автоматически
+отменяет все pending I/O (completions приходят с `ERROR_OPERATION_ABORTED`);
+когда `pendingOps_` обнуляется, в реактор постится `disposeOperation_`
+(`detach`), по завершении которого соединение возвращает состояние в `NONE` и
+выдаёт терминальный колбэк: `EXPLICIT_DISPOSE` → `onDisposed()`; иначе
+`wasConnected_ ? onDisconnect(reason) : onConnect(reason)`. Отменённая
+send-операция всё равно получает терминальный `onCommit(ERROR_OPERATION_ABORTED)`
+— пользователь может освободить контекст. `CancelIoEx` и подмена callback на
+cancellation-хэндлеры не используются. Уничтожение объекта раньше терминального
+колбэка запрещено (assert на `pendingOps_` в деструкторе).
 
 ### ADR-6. Ошибки
 
@@ -151,65 +207,150 @@ v1: один цикл = один поток, внутренних блокиро
 
 ### ADR-8. Qt-подобие — только async
 
-Копируем состояния `Unconnected/Connecting/Connected/Closing` и async events,
-но write принимает reusable caller-owned request с единым completion callback
-(`error == 0` — success). `bytesAvailable` удалён как TOCTOU и лишний syscall;
-после `on_read` пользователь вызывает `read(span)`. **Отвергнуто:** все
-`waitFor*`.
+Копируется async-семантика состояний, но API — делегатный (ADR-3): запись —
+`send(span, send_operation_t&)` с единственным терминальным `onCommit`
+(`error == 0` — успех); после `onReadyRead()` пользователь вызывает
+`read(span)`. `bytesAvailable` удалён как TOCTOU и лишний syscall.
+**Отвергнуто:** все `waitFor*`.
 
 ### ADR-9. Размер — измеряемая метрика
 
 Флаги: clang → `-Os -ffunction-sections -fdata-sections -fno-exceptions
--fno-rtti -flto`, линковка `-Wl,--gc-sections -s`.
-CMake-таргет `size-report` (`size -A` по секциям). Бюджет размера
+-fno-rtti -flto`; линковка — DCE/схлопывание: в MSYS2 (GNU ld) это
+`-Wl,--gc-sections -s`. CMake-таргет `size-report` (`size -A` по секциям);
+сводная метрика — `dec` из `size` (text+data+bss). Бюджет размера
 устанавливается после первого замера (Этап 0), а не выдумывается заранее.
+
+Особенность кросс-сборки (проверено 20.08.2026): линкер lld-link
+(MSVC-таргет) **молча игнорирует** GNU-опции `--gc-sections`/`-s` — без DCE
+замер фиктивен (etsl.exe: text 404 890 байт); рабочие опции —
+`/OPT:REF` + `/OPT:ICF`. MinSizeRel-конфигурация кросс-сборки —
+каталог `cmake-build-minsize-clang-windows/`; size-флаги передаются через
+`CMAKE_CXX_FLAGS_MINSIZEREL`/`CMAKE_EXE_LINKER_FLAGS_MINSIZEREL` (базовые
+CFLAGS/LINKER_FLAGS задаются toolchain-файлом обычными переменными и cache
+`-D` не перекрывают).
+
+Раскладка веса (etsl.exe MinSizeRel, dec, 20.08.2026) — выбор CRT решает всё:
+
+| Рантайм (toolchain) | dec | Примечание |
+|---|---|---|
+| `MultiThreadedDLL` (динамический CRT) | **12 647 байт** | сопоставим с июльской серией MSYS2 (baseline 14 КБ, 22 194 байт со smoke в 2.3); требует `vcruntime140.dll` на цели (`ucrtbase.dll` есть в Win10+) |
+| `MultiThreaded` (статический CRT, текущий toolchain) | 97 091 байт | из них 91 366 байт — CRT-подложка пустого `int main(){}` с теми же флагами; **вклад кода etsl ≈ 5,7 КБ** |
+
+Baseline для сопоставления с июльской серией — **12 647 байт (DLL CRT)**:
+библиотека после августовских рефакторингов не распухла (меньше всех прежних
+замеров — текущий `main.cpp` крошечный, smoke-тестов с `<iostream>` больше нет).
+Статическая CRT — цена самодостаточного exe, а не роста библиотеки; выбор
+рантайма остаётся за владельцем toolchain.
+
+### ADR-10. Структура — вертикальные фича-компоненты; `platform/` ликвидируется (25.08.2026)
+
+Пересмотр исходной концепции «`platform/` — тонкие платформенные обёртки,
+выше — высокоуровневая абстракция над ними». Факты на момент пересмотра:
+`src/platform/` вмещает 17 из 30 файлов библиотеки (~64% строк), включая
+крупнейшие (`tcp_connection_iocp.cppm`, 388 строк; `tcp_acceptor_iocp.cppm`,
+131); обёрток над этими компонентами нет — `main.cpp` и gtest используют
+`C_TCPConnection`/`C_TCPAcceptor` напрямую.
+
+**Решение.** Раскладка по фичам, не по слоям. Каждая фича — вертикальный срез:
+
+- корень фичи — **контракт**: `*_defs` (типы операций), delegate-концепт,
+  alias-umbrella (`C_TCPConnection<T>` = `C_TCPConnectionIOCP<T>` по
+  `_WIN32`). Ноль вызовов ОС;
+- `<feature>/<os>/` — **самодостаточные бекенды** (`iocp/` сейчас, `epoll/` —
+  Этап 4): полная реализация — стейт-машина, операции, teardown. Generic-слоя
+  между контрактом и бекендом нет и не планируется;
+- переиспользование между ОС — только контракт и ос-шины (`net:*`,
+  `socket:factory`; ветвление ОС — в global module fragment).
+
+Безфичевое OS-клей: `win.wsa` (единственный потребитель — `reactor_iocp.cpp`)
+→ `reactor/iocp/`; `etl_chrono.cpp` (QPC/`clock_gettime` для ETL) → `util/`.
+Целевое дерево — §4; физический переезд — задача 2.7. Имена модулей и
+партиций от путей не зависят (`net.tcp_connection:iocp` и т.д.) — переезд
+меняет только `FILE_SET` в CMakeLists.txt.
+
+**Почему.** IOCP (проактор) и epoll (реактор) фундаментально различны: чтение —
+0-byte `WSARecv`-проба + синхронный `read()` из колбэка (ADR-2) против LT
+`EPOLLIN`-readiness; запись — проактивные `WSASend` против досылки по
+`EPOLLOUT`; teardown — `closesocket`-отмена pending ops против
+`EPOLLRDHUP`/`EPOLLHUP`. Реально совпадает у будущих реализаций только
+контракт (у connection — ~65 строк: defs + delegate + alias). «Низ» и «верх»
+с нужной унитарностью не разделяются: `C_TCPConnectionIOCP` — цельный
+компонент, обёртка поверх не добавляет ничего. `reactor/` — компонент той же
+природы — уже живёт во фича-раскладке вне `platform/`; два конкурирующих
+паттерна для однородных компонентов недопустимы.
+
+**Отвергнуто:** оставить `platform/` домом компонентов — название врёт (не
+«тонкие обёртки», а две трети кода); generic базовый класс connection с
+виртуальными хуками — vtable/type-erasure против ADR-3 и бюджета размера
+(ADR-9); CRTP-generic connection поверх тонких шим — требует унитарности,
+которой нет (см. «Почему»).
 
 ---
 
-## 4. Целевая структура модулей
+## 4. Структура модулей (целевая по ADR-10, обновлено 25.08.2026)
+
+> До выполнения задачи 2.7 содержимое `net/` физически лежит в
+> `src/platform/net/`, `win.wsa` — в `src/platform/wsa/`, `etl_chrono.cpp` —
+> в `src/platform/util/`; имена модулей и импорты уже целевые, переезд меняет
+> только пути в `FILE_SET`. Новые файлы сразу класть по целевым путям.
 
 ```
 src/
-├── core/
-│   ├── error.cppm             # library errors / portable mapping
-│   └── socket_types.cppm      # единственное определение socket_t      (Этап 0, из socket.cppm)
-├── reactor/                   # переименование event_loop/ (Этап 1):
-│   │                          # имя должно отражать readiness-семантику
-│   ├── reactor.cppm           # alias C_Reactor = бэкенд по _WIN32/__linux__
-│   ├── reactor_trait.cppm     # concept + static_assert бэкенда
-│   └── impl/
-│       ├── iocp/reactor_iocp.cppm/.cpp
-│       └── epoll/reactor_epoll.cppm/.cpp  # Linux, Этап 4
+├── net/                              # сетевая фича-ветка: словарь, шимы, tcp
+│   ├── net.cppm                      # umbrella: export import :defs :ops :address
+│   ├── net_defs.cppm                 # socket_t, INVALID_SOCKET, sockaddr-алиасы
+│   ├── net_ops.cppm/.cpp             # ParseIPV4, CloseSocket, Shutdown,
+│   │                                 # GetExtensionFunction — ос-шины (GMF)
+│   ├── net_address.cppm/.cpp         # C_Address (модуль net:address)
+│   └── tcp/
+│       ├── connection/               # контракт в корне, бекенды — в <os>/
+│       │   ├── tcp_connection.cppm                 # alias C_TCPConnection<T>
+│       │   ├── tcp_connection_defs.cppm            # send_operation_t
+│       │   ├── tcp_connection_delegate_trait.cppm  # concept TCPConnectionDelegate
+│       │   └── iocp/                 # C_TCPConnectionIOCP + defs_iocp
+│       └── acceptor/                 # тот же шаблон
+│           ├── tcp_acceptor.cppm                   # alias C_TCPAcceptor
+│           ├── tcp_acceptor_def.cppm               # accept_operation_t
+│           └── iocp/                 # C_TCPAcceptorIOCP
+├── reactor/                          # эталон фича-раскладки (ADR-10)
+│   ├── reactor.cppm                  # alias C_Reactor по _WIN32/__linux__
+│   ├── reactor_trait.cppm            # concept ReactorTrait: initialize/run/
+│   │                                 # shutdown/associate/detach/post/
+│   │                                 # addTimer/removeTimer
+│   └── iocp/                         # reactor_iocp.cppm/_defs.cppm/.cpp;
+│                                     # wsa_initializer — после 2.7; epoll/ — Этап 4
 ├── socket/
-│   ├── socket.cppm/.cpp       # RAII-хэндл + close (слить raii+independent)
-│   ├── socket_factory.cppm    # модуль socket.factory (имя файла = имя модуля)
-│   ├── socket_address.cppm/.cpp  # обёртка над sockaddr_storage (C_Address) (Этап 2)
-│   ├── tcp_socket.cppm/.cpp   # Qt-подобный async API                  (Этап 2)
-│   ├── tcp_write_request.cppm # caller-owned TCP write operation
-│   └── tcp_server.cppm/.cpp   # AcceptEx                               (Этап 2)
-├── timer/                       # таймеры реактора                      (Этап 2, 2.1)
-│   ├── timer.cppm               # C_Timer: arm/execute; «взведён» ⇔ is_linked()
-│   ├── timer_types.cppm         # clock_t, time_point_t, timer_cb_t
-│   └── timer_bucket.cppm/.cpp   # сортированный intrusive-список дедлайнов
-└── platform/
-    ├── net/
-    │   ├── tcp_driver.cppm          # platform driver alias
-    │   ├── tcp_driver_types.cppm    # общий platform driver contract
-    │   ├── iocp/tcp_driver_iocp.cppm/.cpp
-    │   └── epoll/tcp_driver_epoll.cppm/.cpp  # Этап 4
-    ├── wsa_initializer.cppm/.cpp  # только Windows; на Linux — отсутствует
-    └── etl_chrono.cpp           # etl_get_steady_clock (QPC / clock_gettime) (Этап 2)
+│   ├── socket.cppm                   # umbrella: export import :raii :factory
+│   ├── socket_raii.cppm              # C_Socket — RAII-хэндл
+│   └── socket_factory.cppm           # CreateSocket — ос-шина (GMF после 2.7)
+├── timer/                            # timer, timer:types, timer.bucket —
+│                                     # пользовательские таймеры реактора,
+│                                     # к I/O-путям не относятся (ADR-2)
+└── util/                             # noncopyable.h; etl_chrono.cpp — после 2.7
+
+test/tcp_connection_iocp_test.cpp  # gtest-набор соединения (30 тестов)
 ```
 
 Соглашения: имя файла модуля == имя модуля; `export module <domain>[.<sub>]`;
-namespace `etsl`; классы с префиксом `C_`, методы `snake_case` (как в текущем коде).
+namespace `etsl`; классы с префиксом `C_`, методы `snake_case`. Запланированные
+ранее `core/error.cppm`, `socket/socket_address`, `socket/tcp_socket`,
+`socket/tcp_write_request` не появились: их роли заняли `net:*`,
+делегатный контракт соединения и `send_operation_t` (ADR-2/ADR-3). Каталог
+`src/platform/` после 2.7 не существует; новых каталогов-«слоёв» не заводить —
+только фича-ветки по ADR-10.
 
 ---
 
-## 5. Известные дефекты текущего кода (проверено 2026-07-18)
+## 5. Известные дефекты (обновлено 2026-08-20)
 
-Фиксятся в Этапе 0. Проверка повторно не требуется — факты подтверждены сборкой
-и препроцессором.
+D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оставлены как история.
+
+- **D9** *(открыт, найден 2026-08-20)*: POST_BUILD deploy-хук таргета `etsl`
+  (`CMakeLists.txt`) использует ключ `~/.ssh/wsa-dev`, которого на машине нет, —
+  фактический ключ ВМ `win-dev` — `~/.ssh/win-dev`. Сборка `etsl` падает на
+  деплое; тестовый таргет не затронут. Заодно хук закомментированной обёрткой
+  `#if(WIN32)` — при кросс-сборке из Linux условие ложно, но хук активен.
 
 - **D1.** `#if defined(WINNT)` — `WINNT` определяет **только MinGW**-тулчейн
   (проверено препроцессором); MSVC его не определяет → под `cl` ветка уходит в
@@ -285,7 +426,7 @@ baseline размера зафиксирован.
       refactor 23.07.2026)**
 - [x] **1.4** Readiness-чтение по ADR-2: 0-byte `WSARecv` → `MSG_PEEK` →
       read/closed/re-arm. На этапе 2.3 перенесено из generic reactor в
-      `C_TcpSocketDriverIOCP`. **(19.07.2026; move 23.07.2026)**
+      `C_TCPConnectionIOCP`. **(19.07.2026; move 23.07.2026)**
 - [x] **1.5** `post()`/`shutdown()`: `PostQueuedCompletionStatus` с
       зарезервированным completion key (`iocp_code_e`); `run()` исполняет posted
       tasks (проверено кросс-поточным прогоном). **(19.07.2026)**
@@ -299,7 +440,7 @@ baseline размера зафиксирован.
 с кодом `WSAECONNRESET` (10054) — проверено прогоном с `SO_LINGER{1,0}`;
 размер MinSize = 18 КБ (baseline 14 КБ; рост — в основном `<iostream>` в smoke-тесте).
 
-### Этап 2 — tcp_socket / tcp_server
+### Этап 2 — tcp_connection (исходно tcp_socket) / tcp_server
 
 **Цель:** Qt-подобный async API поверх реактора; ноль `#ifdef` в этом слое.
 
@@ -319,31 +460,79 @@ baseline размера зафиксирован.
       сейчас, дорого потом). Парсинг — `ParseIPV4` в `platform/net_ops`
       (`inet_pton`, ошибка через `etl::expected`). Проверено сборкой и прогоном:
       валидный IPv4 → `size()==16`, `sa_family==AF_INET`; невалидный IP → ошибка. **(20.07.2026)**
+      *Позже (13.08.2026) при реструктуризации переехал в
+      `platform/net/net_address.cppm` (модуль `net:address`, umbrella `net`).*
 - [x] **2.3** `tcp_socket`: generic IOCP completion dispatcher;
-      `C_TcpSocketDriverIOCP` внутри `platform/net/iocp`; `ConnectEx` с wildcard
+      `C_TCPConnectionIOCP` внутри `platform/net/iocp`; `ConnectEx` с wildcard
       bind; persistent read-probe; `read(span)` без `bytesAvailable`;
       caller-owned `C_TcpWriteRequest`, FIFO и proactive `WSASend` без timer/ring;
       states и безопасный `DISPOSED` после отмен. Smoke: три FIFO operations на
       двух reusable request slots, включая reentrant reuse из completion,
       loopback read и teardown; отдельный close-after-write smoke проверяет
       cancellation callbacks двух одновременно активных операций.
-      MinSize executable с обоими smoke: 22 194 байт. **(23.07.2026)**
+      MinSize executable с обоими smoke: 22 194 байта. **(23.07.2026)**
+      *Дальнейшая эволюция (август 2026, фактическое состояние): делегатная
+      архитектура `C_TCPSocketDriver<T>` + concept `TCPDriverDelegate` (09.08);
+      оптимизации драйвера (10.08); переезд в `platform/net/tcp/` (13.08);
+      переименование в `C_TCPConnection<T>`/`TCPConnectionDelegate`, модуль
+      `net.tcp_connection`, тест `tcp_connection_iocp_test` (21.08) — класс
+      стал полноценным соединением, имя «driver» потеряло исходный смысл.
+      Generic `tcp_socket`-слой, event-enum `EV_*`, FIFO write-очередь и
+      `C_TcpWriteRequest` упразднены: полу-проактивная модель I/O с
+      множеством caller-owned `send_operation_t` и teardown через
+      `closesocket`+`pendingOps_` (ADR-2/ADR-3/ADR-4/ADR-5).*
+      *Реальный вес после эволюции (замер 20.08.2026, см. ADR-9): с динамическим
+      CRT — **12 647 байт** (лучше прежних 22 194: smoke-тестов с `<iostream>`
+      больше нет, `main.cpp` минимальный); со статическим CRT кросс-тулчейна —
+      97 091 байт, из которых 91 366 — CRT-подложка пустого `main`, т.е. вклад
+      кода etsl ≈ **5,7 КБ**. Рост библиотеки нет; разница с июлём — только
+      способ линковки CRT.*
 - [ ] **2.4** `tcp_server`: `listen(backlog)`, пул posted `AcceptEx` (буфер
       адресов `(sizeof(sockaddr_storage)+16)*2` на accept), `onIncoming` с
-      готовым `tcp_socket`, repost. `SO_EXCLUSIVEADDRUSE` вместо `SO_REUSEADDR`.
+      готовым соединением подключённого пира (делегатная модель, ADR-3), repost.
+      `SO_EXCLUSIVEADDRUSE` вместо `SO_REUSEADDR`.
+      *В работе (24.08.2026): контракт `net.tcp_acceptor` (defs + alias) и
+      `C_TCPAcceptorIOCP` — пул posted `AcceptEx` на `etl::pool` (32),
+      repost из completion; teardown-пути и делегатные колбэки (`onIncoming`)
+      ещё не заведены (todo в коде); `main.cpp` упражняет acceptor вручную.*
 - [ ] **2.5** `examples/echo_client.cpp` + `examples/echo_server.cpp`; гонка
       ≥ 64 МБ без потерь/рассинхрона; зафиксировать размер sample:
       `echo_server: ___ КБ` → установить бюджет.
+- [x] **2.6** *(добавлено постфактум)* gtest-набор `test/tcp_connection_iocp_test.cpp`
+      (GoogleTest v1.17.0 FetchContent, опция `ETSL_BUILD_TESTS`; кросс-сборка,
+      прогон на Windows-ВМ): 30 тестов — teardown/dispose-контракт, connect и
+      реконнекты (включая реентерабельный `connect()` из `onDisconnect`),
+      read-probe (в т.ч. данные пира, отправленные до завершения коннекта),
+      проактивная запись (последовательная, параллельные операции с
+      сохранением TCP-порядка, отмена pending send), два соединения на одном
+      реакторе. Известное ограничение loopback: «RST при pending send»
+      недетерминирован (WinSock буферизует отправку без flow control) — путь
+      покрыт по частям dispose-отменой и abortive-close тестами. **(20.08.2026)**
+      *Замер размера (ADR-9, 20.08.2026): MinSizeRel-сборка тестового exe —
+      `dec` 673 367 байт (text 666 190 + data 7 177; gtest и CRT статические).
+      MinSizeRel-бинарь проверен прогоном на ВМ: 30/30 PASSED (assert'ы
+      отключены NDEBUG).*
+- [ ] **2.7** *(добавлено 25.08.2026)* Реструктуризация по ADR-10 — физический
+      переезд без переименования модулей и импортов: `src/platform/net/**` →
+      `src/net/**`; `src/platform/wsa/wsa_initializer.*` → `src/reactor/iocp/`;
+      `src/platform/util/etl_chrono.cpp` → `src/util/`; каталог `src/platform/`
+      удалить. Обновить пути в `FILE_SET CXX_MODULES` (`CMakeLists.txt`).
+      Заодно: `socket_factory.cppm` — ветвление ОС из тела в global module
+      fragment (ос-шина в стиле `net_ops.cppm`; сейчас файл безусловно
+      включает `winsock2.h`/`ioctlsocket`). Проверка: кросс-сборка, gtest на
+      ВМ (§2), `size-report` в пределах шума.
 
-**DoD:** echo-пара работает под нагрузкой; `tcp_socket`/`tcp_server` не содержат
-`#ifdef`; бюджет размера установлен.
+**DoD:** echo-пара работает под нагрузкой; контрактные модули соединения
+не содержат вызовов ОС и `#ifdef` (кроме alias-umbrella); бюджет размера
+установлен.
 
 ### Этап 3 — Доводка
 
-- [ ] **3.1** Connect timeout (таймер + `CancelIoEx`, состояние → `Unconnected`,
-      `onError(TimedOut)`).
-- [ ] **3.2** Graceful close: `shutdown(SD_SEND)` → у пира `EV_CLOSED`;
-      полузакрытие корректно обрабатывается.
+- [ ] **3.1** Connect timeout: таймер пользователя (ADR-2) + `dispose()` —
+      closesocket отменяет ConnectEx; терминальный колбэк `onConnect(error)`.
+      Таймерная эмуляция readiness не используется.
+- [ ] **3.2** Graceful close: `shutdown(SD_SEND)` → у пира EOF (`read()==0` →
+      `onDisconnect(0)`); полузакрытие корректно обрабатывается.
 - [ ] **3.3** Backpressure: high-watermark tx-буфера, пауза взвода чтения,
       пока tx не проседает (защита от медленного пира).
 - [ ] **3.4** `to_portable()` для частых кодов: `WSAEWOULDBLOCK`,
@@ -359,19 +548,19 @@ baseline размера зафиксирован.
 **Цель:** те же examples собираются и работают на Linux **без изменений** —
 проверка унитарности интерфейсов.
 
-- [ ] **4.1** `reactor/impl/epoll/reactor_epoll.*`: `epoll_create1`, LT-режим
+- [ ] **4.1** `reactor/epoll/reactor_epoll.*`: `epoll_create1`, LT-режим
       и `eventfd` для `post()/shutdown()`; reactor остаётся generic
       demultiplexer без знания TCP операций.
-- [ ] **4.2** `platform/net/epoll/tcp_driver_epoll.*`: `EPOLLIN` →
-      `READ_READY`; active write продолжать по `EPOLLOUT`, отключая interest
-      после полного request; тот же `CONNECTED/CLOSED/IO_ERROR/DISPOSED`
-      contract, что у IOCP driver.
-- [ ] **4.3** `platform/wsa_initializer` — на Linux отсутствует; `CloseSocket`
-      → `::close`; `last_error()` → `errno`.
-- [ ] **4.4** CI/пресет Linux-сборки; прогон smoke + echo на обеих ОС.
+- [ ] **4.2** `net/tcp/connection/epoll/*`: `EPOLLIN` →
+      `onReadyRead` (синхронный `read()` в колбэке); active write продолжать
+      по `EPOLLOUT`, отключая interest после терминального `onCommit`;
+      тот же `TCPConnectionDelegate`-контракт, что у IOCP-реализации.
+- [ ] **4.3** `reactor/iocp/wsa_initializer` (`win.wsa`) — на Linux отсутствует;
+      `CloseSocket` → `::close`; `last_error()` → `errno`.
+- [ ] **4.4** CI/пресет Linux-сборки; прогон gtest-набора + echo на обеих ОС.
 
-**DoD:** user-код examples идентичен на обеих платформах; отличия только в
-`reactor/impl` и `platform/`.
+**DoD:** user-код examples идентичен на обеих платформах; отличия — только
+внутри `<feature>/<os>/`-партиций (ADR-10).
 
 ---
 
@@ -382,21 +571,31 @@ baseline размера зафиксирован.
    `std::function`, `std::error_code`, `iostream`, `printf`-логирование.
 3. `noexcept` по умолчанию на всех публичных функциях; ошибки — только через
    `etl::expected` (ADR-6).
-4. Платформенный код — только в `reactor/impl/*` и `platform/*`; transport
-   drivers находятся в `platform/net/*`. Верхние слои без `#ifdef` (ADR-1).
-5. Один pending OVERLAPPED на направление на сокет; лайфтайм по ADR-5.
+4. ОС-специфичный код — только в партициях `<feature>/<os>/` (`reactor/iocp/`,
+   `net/tcp/connection/iocp/`, `net/tcp/acceptor/iocp/`, …) и в ос-шинах
+   (`net:defs`, `net:ops`, `socket:factory` — ветвление в global module
+   fragment). Контрактные модули (defs, delegate-концепты) не содержат
+   вызовов ОС; alias-umbrella выбирает бекенд по `_WIN32`/`__linux__`.
+   Пользовательский делегат платформенно-нейтрален (ADR-3, ADR-10).
+5. Read-probe — ровно один pending OVERLAPPED на сокет; send-операций может
+   быть несколько, каждая со своим caller-owned OVERLAPPED (ADR-2/ADR-4);
+   лайфтайм по ADR-5.
 6. Каждый новый модуль — в `FILE_SET CXX_MODULES` в `CMakeLists.txt`; имя файла
    == имя модуля.
 7. После каждого этапа — прогон `size-report`, сравнение с baseline/budget.
 8. Минимальные изменения: задача не должна тащить рефакторинг соседнего кода.
 9. Язык проекта: RU/ENG — комментарии и документация допустимы на обоих языках.
+10. После изменений reactor/tcp connection — кросс-сборка и прогон gtest-набора на
+    Windows-ВМ (см. §2); изменение публичного контракта соединения сопровождать
+    правкой тестов. Код тестов править можно, код библиотеки — только по задаче.
 
 ---
 
 ## 8. Открытые вопросы (отложенные решения)
 
-- **EV_WRITE наружу:** транслировать ли writability пользователю (таймер-подход
-  или AFD poll)? v1 — нет; пересмотреть после Этапа 3, если появится спрос.
+- **EV_WRITE наружу:** вопрос снят (20.08.2026) — запись полностью проактивная
+  (`send` + терминальный `onCommit`, см. ADR-2), трансляция writability наружу
+  не нужна; эмуляция readiness таймерами отвергнута.
 - **DNS:** блокирующий `getaddrinfo` vs overlapped `GetAddrInfoEx` — решение
   фиксируется в задаче 3.5.
 - **UDP:** вне v1; `socket_factory` не должен её блокировать (см. D3).

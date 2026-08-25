@@ -1,7 +1,7 @@
 //
 // Created by sexey on 27.07.2026.
 //
-export module net.tcp_socket_driver;
+export module net.tcp_connection;
 
 export import :defs;
 
@@ -10,7 +10,7 @@ import :iocp;
 export namespace etsl
 {
     template<typename T>
-    using C_TCPSocketDriver = C_TCPSocketDriverIOCP<T>;
+    using C_TCPConnection = C_TCPConnectionIOCP<T>;
 }
 #elif defined(__linux__)
 #error "Linux tcp socket driver is not implemented yet"

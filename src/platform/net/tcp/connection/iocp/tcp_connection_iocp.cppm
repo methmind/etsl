@@ -9,7 +9,9 @@ module;
 #include <etl/expected.h>
 #include <etl/endianness.h>
 
-export module net.tcp_socket_driver:iocp;
+#include <util/noncopyable.h>
+
+export module net.tcp_connection:iocp;
 
 import reactor;
 import net;
@@ -19,17 +21,19 @@ import :defs;
 import :delegate;
 import :defs_iocp;
 
-#define FlushOperation(operation) ZeroMemory(&(operation), sizeof(WSAOVERLAPPED))
+#define FlushOperation(operation) memset(static_cast<WSAOVERLAPPED*>(&(operation)), 0, sizeof(WSAOVERLAPPED))
 
 export namespace etsl
 {
     template<typename delegate_t>
-    class C_TCPSocketDriverIOCP
+    class C_TCPConnectionIOCP
     {
     public:
-        ~C_TCPSocketDriverIOCP() noexcept { assert(this->pendingOps_ == 0 && "UAF error caught!"); }
+        ~C_TCPConnectionIOCP() noexcept { assert(this->pendingOps_ == 0 && "UAF error caught!"); }
 
-        explicit C_TCPSocketDriverIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept;
+        explicit C_TCPConnectionIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept;
+
+        ETSL_NON_COPYABLE_NON_MOVABLE(C_TCPConnectionIOCP);
 
         void dispose() noexcept { beginTeardown(EXPLICIT_DISPOSE); }
 
@@ -46,12 +50,10 @@ export namespace etsl
     private:
         [[nodiscard]] static etl::expected<void, int32_t> EphemeralBind(socket_t fd) noexcept;
 
-        [[nodiscard]] static etl::expected<LPFN_CONNECTEX, int32_t> GetConnectEx(socket_t fd) noexcept;
-
         [[nodiscard]] static etl::expected<void, int32_t> ConnectEx(socket_t fd, const C_Address& addr,
             WSAOVERLAPPED& completion) noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> createConnectOperation(const C_Address& addr) noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> createConnectOperation(const C_Address& addr, C_Socket&& fd) noexcept;
 
         [[nodiscard]] etl::expected<void, int32_t> createReadProbeOperation() noexcept;
 
@@ -74,7 +76,7 @@ export namespace etsl
         C_Reactor::dispose_operation_t disposeOperation_{};
 
         C_Socket fd_;
-        tcp_socket_state_e state_;
+        tcp_connection_state_e state_;
         uint32_t pendingOps_;
 
         bool wasConnected_;
@@ -84,23 +86,23 @@ export namespace etsl
     };
 
     template<typename delegate_t>
-    C_TCPSocketDriverIOCP<delegate_t>::C_TCPSocketDriverIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept :
-        reactor_(reactor), fd_(INVALID_SOCKET), state_(tcp_socket_state_e::NONE), pendingOps_(0),
+    C_TCPConnectionIOCP<delegate_t>::C_TCPConnectionIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept :
+        reactor_(reactor), fd_(INVALID_SOCKET), state_(tcp_connection_state_e::NONE), pendingOps_(0),
         wasConnected_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
     {
-        static_assert(TCPDriverDelegate<delegate_t>, "Delegate must satisfy tcp driver delegate trait!");
+        static_assert(TCPConnectionDelegate<delegate_t>, "Delegate must satisfy tcp connection delegate trait!");
 
         this->readinessOperation_.callback = decltype(this->readinessOperation_.callback)::template create<
-            C_TCPSocketDriverIOCP, &C_TCPSocketDriverIOCP::onReadinessOperation>(*this);
+            C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onReadinessOperation>(*this);
 
         this->disposeOperation_.callback = decltype(this->disposeOperation_.callback)::template create<
-            C_TCPSocketDriverIOCP, &C_TCPSocketDriverIOCP::onDisposeOperation>(*this);
+            C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onDisposeOperation>(*this);
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPSocketDriverIOCP<delegate_t>::connect(const C_Address& addr) noexcept
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::connect(const C_Address& addr) noexcept
     {
-        if (this->state_ != tcp_socket_state_e::NONE || this->pendingOps_) {
+        if (this->state_ != tcp_connection_state_e::NONE || this->pendingOps_) {
             return etl::unexpected(static_cast<int32_t>(WSAEALREADY));
         }
 
@@ -109,9 +111,7 @@ export namespace etsl
             return etl::unexpected(socketCreateResult.error());
         }
 
-        this->fd_ = std::move(*socketCreateResult);
-        if (const auto err = createConnectOperation(addr); !err) {
-            this->fd_.dispose();
+        if (const auto err = createConnectOperation(addr, std::move(*socketCreateResult)); !err) {
             return etl::unexpected(err.error());
         }
 
@@ -119,9 +119,13 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<uint32_t, int32_t> C_TCPSocketDriverIOCP<delegate_t>::read(const etl::span<uint8_t>& content) noexcept
+    etl::expected<uint32_t, int32_t> C_TCPConnectionIOCP<delegate_t>::read(const etl::span<uint8_t>& content) noexcept
     {
-        if (this->state_ != tcp_socket_state_e::CONNECTED) {
+        if (content.empty()) {
+            return etl::unexpected(WSAEINVAL);
+        }
+
+        if (this->state_ != tcp_connection_state_e::CONNECTED) {
             return etl::unexpected(WSAENOTCONN);
         }
 
@@ -147,15 +151,15 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPSocketDriverIOCP<delegate_t>::EphemeralBind(socket_t fd) noexcept
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::EphemeralBind(socket_t fd) noexcept
     {
-        constexpr sockaddr_in addrAny{
+        constexpr os_sockaddr_in_t addrAny{
             .sin_family = AF_INET,
             .sin_port = 0,
             .sin_addr.s_addr = etl::hton<uint32_t>(INADDR_ANY)
         };
 
-        if (bind(fd, reinterpret_cast<const sockaddr*>(&addrAny), sizeof(addrAny)) == SOCKET_ERROR) {
+        if (bind(fd, reinterpret_cast<const os_sockaddr*>(&addrAny), sizeof(addrAny)) == SOCKET_ERROR) {
             return etl::unexpected(WSAGetLastError());
         }
 
@@ -163,31 +167,16 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<LPFN_CONNECTEX, int32_t> C_TCPSocketDriverIOCP<delegate_t>::GetConnectEx(socket_t fd) noexcept
-    {
-        DWORD bytes = 0;
-        GUID fnGUID = WSAID_CONNECTEX;
-
-        LPFN_CONNECTEX fnPtr = nullptr;
-        if (WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &fnGUID, sizeof(fnGUID),
-            &fnPtr, sizeof(fnPtr), &bytes, nullptr, nullptr) != ERROR_SUCCESS) {
-            return etl::unexpected(WSAGetLastError());
-        }
-
-        return fnPtr;
-    }
-
-    template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPSocketDriverIOCP<delegate_t>::ConnectEx(socket_t fd, const C_Address& addr,
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::ConnectEx(socket_t fd, const C_Address& addr,
         WSAOVERLAPPED& completion) noexcept
     {
-        static auto getResult{GetConnectEx(fd)};
+        static auto getResult{GetExtensionFunction(fd, WSAID_CONNECTEX)};
         if (!getResult) {
             return etl::unexpected(getResult.error());
         }
 
-        const auto connectEx = *getResult;
-        if (!connectEx(fd, &addr.data(), static_cast<int>(addr.size()), nullptr, 0, nullptr, &completion)) {
+        const auto connectEx = static_cast<LPFN_CONNECTEX>(*getResult);
+        if (!connectEx(fd, &addr.data(), static_cast<int32_t>(addr.size()), nullptr, 0, nullptr, &completion)) {
             if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
                 return etl::unexpected(err);
             }
@@ -197,31 +186,32 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPSocketDriverIOCP<delegate_t>::createConnectOperation(const C_Address& addr) noexcept
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::createConnectOperation(const C_Address& addr, C_Socket&& fd) noexcept
     {
-        if (const auto err = this->reactor_.associate(this->fd_.get()); !err) {
+        if (const auto err = this->reactor_.associate(fd.get()); !err) {
             return etl::unexpected(err.error());
         }
 
-        if (const auto err = EphemeralBind(this->fd_.get()); !err) {
+        if (const auto err = EphemeralBind(fd.get()); !err) {
             return etl::unexpected(err.error());
         }
 
         FlushOperation(this->readinessOperation_);
-        if (const auto err = ConnectEx(this->fd_.get(), addr, this->readinessOperation_); !err) {
+        if (const auto err = ConnectEx(fd.get(), addr, this->readinessOperation_); !err) {
             return etl::unexpected(err.error());
         }
 
         ++this->pendingOps_;
-        this->state_ = tcp_socket_state_e::CONNECTING;
+        this->state_ = tcp_connection_state_e::CONNECTING;
+        this->fd_ = std::move(fd);
 
         return {};
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPSocketDriverIOCP<delegate_t>::createReadProbeOperation() noexcept
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::createReadProbeOperation() noexcept
     {
-        if (this->state_ != tcp_socket_state_e::CONNECTED) {
+        if (this->state_ != tcp_connection_state_e::CONNECTED) {
             return etl::unexpected(static_cast<int32_t>(WSAEINVAL));
         }
 
@@ -240,15 +230,15 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPSocketDriverIOCP<delegate_t>::createSendOperation(send_operation_t& operation) noexcept
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::createSendOperation(send_operation_t& operation) noexcept
     {
-        if (this->state_ != tcp_socket_state_e::CONNECTED) {
+        if (this->state_ != tcp_connection_state_e::CONNECTED) {
             return etl::unexpected(static_cast<int32_t>(WSAEINVAL));
         }
 
         FlushOperation(operation);
         operation.callback = decltype(operation.callback)::create<
-            C_TCPSocketDriverIOCP, &C_TCPSocketDriverIOCP::onSendOperation>(*this);
+            C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onSendOperation>(*this);
 
         WSABUF buffer = {
             .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
@@ -266,18 +256,18 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPSocketDriverIOCP<delegate_t>::beginTeardown(int32_t reason) noexcept
+    void C_TCPConnectionIOCP<delegate_t>::beginTeardown(int32_t reason) noexcept
     {
         if (this->cachedDisposeReason_ == INVALID_CACHE_VALUE || reason == EXPLICIT_DISPOSE) {
             this->cachedDisposeReason_ = reason;
         }
 
         if (this->fd_.is_valid()) {
-            this->wasConnected_ = (this->state_ == tcp_socket_state_e::CONNECTED);
+            this->wasConnected_ = (this->state_ == tcp_connection_state_e::CONNECTED);
             this->fd_.dispose();
         }
 
-        this->state_ = tcp_socket_state_e::DISPOSING;
+        this->state_ = tcp_connection_state_e::DISPOSING;
         if (this->pendingOps_) {
             return;
         }
@@ -290,14 +280,14 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPSocketDriverIOCP<delegate_t>::onConnectRoutine() noexcept
+    void C_TCPConnectionIOCP<delegate_t>::onConnectRoutine() noexcept
     {
         if (setsockopt(this->fd_.get(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) != ERROR_SUCCESS) {
             beginTeardown(WSAGetLastError());
             return;
         }
 
-        this->state_ = tcp_socket_state_e::CONNECTED;
+        this->state_ = tcp_connection_state_e::CONNECTED;
         this->delegate_.onConnect(0);
 
         if (const auto err = createReadProbeOperation(); !err) {
@@ -306,20 +296,16 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPSocketDriverIOCP<delegate_t>::onReadRoutine() noexcept
+    void C_TCPConnectionIOCP<delegate_t>::onReadRoutine() noexcept
     {
         this->delegate_.onReadyRead();
-        if (this->state_ != tcp_socket_state_e::CONNECTED) {
-            return;
-        }
-
         if (const auto err = createReadProbeOperation(); !err) {
             beginTeardown(err.error());
         }
     }
 
     template<typename delegate_t>
-    void C_TCPSocketDriverIOCP<delegate_t>::onReadinessOperation(C_Reactor::operation_t& /*operation*/,
+    void C_TCPConnectionIOCP<delegate_t>::onReadinessOperation(C_Reactor::operation_t& /*operation*/,
         uint32_t /*transferred*/, int32_t error) noexcept
     {
         --this->pendingOps_;
@@ -329,13 +315,13 @@ export namespace etsl
         }
 
         switch (this->state_) {
-            case tcp_socket_state_e::CONNECTING:
+            case tcp_connection_state_e::CONNECTING:
                 onConnectRoutine();
                 break;
-            case tcp_socket_state_e::CONNECTED:
+            case tcp_connection_state_e::CONNECTED:
                 onReadRoutine();
                 break;
-            case tcp_socket_state_e::DISPOSING:
+            case tcp_connection_state_e::DISPOSING:
                 beginTeardown(this->cachedDisposeReason_);
                 break;
             default:
@@ -345,7 +331,7 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPSocketDriverIOCP<delegate_t>::onSendOperation(C_Reactor::operation_t& operation, uint32_t transferred,
+    void C_TCPConnectionIOCP<delegate_t>::onSendOperation(C_Reactor::operation_t& operation, uint32_t transferred,
         int32_t error) noexcept
     {
         auto finalize = [this, &operation](int32_t error) noexcept {
@@ -362,7 +348,7 @@ export namespace etsl
             return;
         }
 
-        if (this->state_ == tcp_socket_state_e::DISPOSING) {
+        if (this->state_ == tcp_connection_state_e::DISPOSING) {
             finalize(ERROR_OPERATION_ABORTED);
             return;
         }
@@ -382,12 +368,12 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPSocketDriverIOCP<delegate_t>::onDisposeOperation() noexcept
+    void C_TCPConnectionIOCP<delegate_t>::onDisposeOperation() noexcept
     {
         assert(this->pendingOps_ == 0 && "Dangling operations!");
 
         auto stackReason = this->cachedDisposeReason_;
-        this->state_ = tcp_socket_state_e::NONE;
+        this->state_ = tcp_connection_state_e::NONE;
         this->cachedDisposeReason_ = INVALID_CACHE_VALUE;
 
         if (stackReason == EXPLICIT_DISPOSE) {

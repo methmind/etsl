@@ -44,10 +44,10 @@ target_sources(etsl_core
         src/reactor/reactor_trait.cppm
         src/reactor/iocp/reactor_iocp.cppm
         src/reactor/iocp/reactor_iocp_defs.cppm
-        src/platform/net/tcp/tcp_socket_driver.cppm
-        src/platform/net/tcp/tcp_socket_driver_defs.cppm
-        src/platform/net/tcp/iocp/tcp_socket_driver_iocp_defs.cppm
-        src/platform/net/tcp/iocp/tcp_socket_driver_iocp.cppm
+        src/platform/net/tcp/connection/tcp_connection.cppm
+        src/platform/net/tcp/connection/tcp_connection_defs.cppm
+        src/platform/net/tcp/connection/iocp/tcp_connection_iocp_defs.cppm
+        src/platform/net/tcp/connection/iocp/tcp_connection_iocp.cppm
         src/socket/socket_factory.cppm
         src/socket/socket_raii.cppm
         src/platform/wsa/wsa_initializer.cppm
@@ -57,9 +57,12 @@ target_sources(etsl_core
         src/platform/net/net_defs.cppm
         src/platform/net/net_ops.cppm
         src/platform/net/net_address.cppm
-        src/platform/net/tcp/tcp_socket_driver_delegate_trait.cppm
+        src/platform/net/tcp/connection/tcp_connection_delegate_trait.cppm
         src/platform/net/net.cppm
         src/socket/socket.cppm
+        src/platform/net/tcp/acceptor/tcp_acceptor.cppm
+        src/platform/net/tcp/acceptor/tcp_acceptor_def.cppm
+        src/platform/net/tcp/acceptor/iocp/tcp_acceptor_iocp.cppm
     PRIVATE
         src/reactor/iocp/reactor_iocp.cpp
         src/platform/wsa/wsa_initializer.cpp
@@ -105,10 +108,10 @@ endif()
 
 #if(WIN32)
     add_custom_command(TARGET etsl POST_BUILD
-        COMMAND ssh -i $ENV{HOME}/.ssh/wsa-dev
+        COMMAND ssh -i $ENV{HOME}/.ssh/win-dev
             sexey@192.168.122.51
             "cmd /c \"taskkill /IM gdbserver.exe /F >nul 2>&1 || exit /b 0\""
-        COMMAND scp -i $ENV{HOME}/.ssh/wsa-dev
+        COMMAND scp -i $ENV{HOME}/.ssh/win-dev
             $<TARGET_FILE:etsl>
             sexey@192.168.122.51:C:/dev/etsl.exe
         COMMENT "Deploying etsl.exe"
