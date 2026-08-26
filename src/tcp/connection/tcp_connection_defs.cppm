@@ -4,9 +4,9 @@
 module;
 #include <etl/span.h>
 
-export module net.tcp_connection:defs;
+export module etsl.tcp.connection:defs;
 
-import reactor;
+import etsl.reactor;
 
 export namespace etsl
 {

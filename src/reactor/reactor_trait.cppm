@@ -6,10 +6,10 @@ module;
 
 #include <etl/expected.h>
 
-export module reactor:trait;
+export module etsl.reactor:trait;
 
-import net;
-import timer;
+import etsl.net;
+import etsl.timer;
 
 export namespace etsl
 {

@@ -4,7 +4,7 @@
 module;
 #include <etl/expected.h>
 
-module net;
+module etsl.net;
 
 import :address;
 import :ops;

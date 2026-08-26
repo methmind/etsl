@@ -1,7 +1,7 @@
 //
 // Created by sexey on 27.07.2026.
 //
-export module net.tcp_connection;
+export module etsl.tcp.connection;
 
 export import :defs;
 

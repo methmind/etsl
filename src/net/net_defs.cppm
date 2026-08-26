@@ -11,7 +11,7 @@ module;
 #error "Unsupported platform"
 #endif
 
-export module net:defs;
+export module etsl.net:defs;
 
 export namespace etsl
 {

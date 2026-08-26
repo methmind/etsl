@@ -11,11 +11,10 @@ module;
 
 #include <util/noncopyable.h>
 
-export module net.tcp_connection:iocp;
+export module etsl.tcp.connection:iocp;
 
-import reactor;
-import net;
-import socket;
+import etsl.reactor;
+import etsl.net;
 
 import :defs;
 import :delegate;
@@ -355,7 +354,6 @@ export namespace etsl
 
         auto& sendOperation = reinterpret_cast<send_operation_t&>(operation);
         sendOperation.transferred += transferred;
-
         if (sendOperation.transferred < sendOperation.content.size()) {
             if (const auto err = createSendOperation(sendOperation); !err) {
                 finalize(err.error());

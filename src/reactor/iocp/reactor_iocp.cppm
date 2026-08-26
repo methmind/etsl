@@ -6,13 +6,12 @@ module;
 #include <etl/expected.h>
 #include <etl/intrusive_list.h>
 
-export module reactor:iocp;
+export module etsl.reactor:iocp;
 
-import net;
+import etsl.net;
+import etsl.timer;
+
 import :iocp_defs;
-
-import timer;
-import timer.bucket;
 
 export namespace etsl
 {

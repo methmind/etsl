@@ -40,36 +40,39 @@ endif()
 
 target_sources(etsl_core
     PUBLIC FILE_SET CXX_MODULES FILES
+        src/etsl.cppm
         src/reactor/reactor.cppm
         src/reactor/reactor_trait.cppm
         src/reactor/iocp/reactor_iocp.cppm
         src/reactor/iocp/reactor_iocp_defs.cppm
-        src/platform/net/tcp/connection/tcp_connection.cppm
-        src/platform/net/tcp/connection/tcp_connection_defs.cppm
-        src/platform/net/tcp/connection/iocp/tcp_connection_iocp_defs.cppm
-        src/platform/net/tcp/connection/iocp/tcp_connection_iocp.cppm
-        src/socket/socket_factory.cppm
-        src/socket/socket_raii.cppm
-        src/platform/wsa/wsa_initializer.cppm
-        src/timer/timer_bucket.cppm
+        src/init/wsa/wsa_initializer.cppm
+        src/net/net.cppm
+        src/net/net_defs.cppm
+        src/net/net_ops.cppm
+        src/net/net_address.cppm
+        src/net/net_socket.cppm
+        src/net/net_socket_factory.cppm
+        src/tcp/connection/tcp_connection.cppm
+        src/tcp/connection/tcp_connection_defs.cppm
+        src/tcp/connection/tcp_connection_delegate_trait.cppm
+        src/tcp/connection/iocp/tcp_connection_iocp_defs.cppm
+        src/tcp/connection/iocp/tcp_connection_iocp.cppm
+        src/tcp/acceptor/tcp_acceptor.cppm
+        src/tcp/acceptor/tcp_acceptor_def.cppm
+        src/tcp/acceptor/iocp/tcp_acceptor_iocp.cppm
         src/timer/timer.cppm
-        src/timer/timer_types.cppm
-        src/platform/net/net_defs.cppm
-        src/platform/net/net_ops.cppm
-        src/platform/net/net_address.cppm
-        src/platform/net/tcp/connection/tcp_connection_delegate_trait.cppm
-        src/platform/net/net.cppm
-        src/socket/socket.cppm
-        src/platform/net/tcp/acceptor/tcp_acceptor.cppm
-        src/platform/net/tcp/acceptor/tcp_acceptor_def.cppm
-        src/platform/net/tcp/acceptor/iocp/tcp_acceptor_iocp.cppm
+        src/timer/timer_bucket.cppm
+        src/timer/timer_impl.cppm
+        src/timer/timer_defs.cppm
+        src/init/initializer.cppm
+        src/init/win/win_initializer.cppm
     PRIVATE
         src/reactor/iocp/reactor_iocp.cpp
-        src/platform/wsa/wsa_initializer.cpp
+        src/init/wsa/wsa_initializer.cpp
         src/timer/timer_bucket.cpp
-        src/platform/util/etl_chrono.cpp
-        src/platform/net/net_ops.cpp
-        src/platform/net/net_address.cpp
+        src/util/etl_chrono.cpp
+        src/net/net_ops.cpp
+        src/net/net_address.cpp
 )
 
 target_include_directories(etsl_core PUBLIC

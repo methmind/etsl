@@ -5,7 +5,7 @@ module;
 #include <etl/chrono.h>
 #include <etl/delegate.h>
 
-export module timer:types;
+export module etsl.timer:defs;
 
 export namespace etsl
 {

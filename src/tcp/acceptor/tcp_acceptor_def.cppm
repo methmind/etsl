@@ -4,11 +4,10 @@
 module;
 #include <cstdint>
 
-export module net.tcp_acceptor:defs;
+export module etsl.tcp.acceptor:defs;
 
-import net;
-import socket;
-import reactor;
+import etsl.net;
+import etsl.reactor;
 
 export namespace etsl
 {

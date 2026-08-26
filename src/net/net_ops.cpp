@@ -15,7 +15,7 @@ module;
 #include <etl/expected.h>
 #include <etl/endianness.h>
 
-module net;
+module etsl.net;
 
 import :ops;
 
@@ -29,7 +29,7 @@ namespace etsl
 
         memset(&storage, 0, sizeof(storage));
 
-        auto sa = reinterpret_cast<os_sockaddr_in_t&>(storage);
+        auto& sa = reinterpret_cast<os_sockaddr_in_t&>(storage);
         sa.sin_family = AF_INET;
         sa.sin_port = etl::hton<uint16_t>(port);
         if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) {

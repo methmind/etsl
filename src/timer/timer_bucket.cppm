@@ -4,9 +4,9 @@
 module;
 #include <etl/intrusive_list.h>
 
-export module timer.bucket;
+export module etsl.timer:bucket;
 
-import timer;
+import :impl;
 
 export namespace etsl
 {

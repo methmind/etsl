@@ -4,10 +4,7 @@
 
 #include "etl/expected.h"
 
-import reactor;
-import net;
-import net.tcp_connection;
-import net.tcp_acceptor;
+import etsl;
 
 const char* hello_world = "Hello, Server!\r\n";
 
@@ -68,7 +65,9 @@ private:
 
 int main()
 {
-    etl::pool<etsl::accept_operation_s, 32> backpressurePool;
+    if (!etsl::Initialize()) {
+        return -1;
+    }
 
     etsl::C_Reactor reactor;
     if (const auto err = reactor.initialize(); !err) {
@@ -89,7 +88,7 @@ int main()
         return err.error();
     }
 
-    /*etsl::C_Address address;
+    etsl::C_Address address;
     if (const auto err = address.initialize("127.0.0.1", 3730); !err) {
         return err.error();
     }
@@ -97,7 +96,7 @@ int main()
     C_Test test(reactor);
     if (const auto err = test.exec(address); !err) {
         return err.error();
-    }*/
+    }
 
     reactor.run();
     return 0;

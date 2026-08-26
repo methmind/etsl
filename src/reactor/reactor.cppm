@@ -3,7 +3,7 @@
 //
 module;
 
-export module reactor;
+export module etsl.reactor;
 
 import :trait;
 

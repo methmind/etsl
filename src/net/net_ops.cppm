@@ -12,7 +12,7 @@ module;
 
 #include <etl/expected.h>
 
-export module net:ops;
+export module etsl.net:ops;
 
 import :defs;
 

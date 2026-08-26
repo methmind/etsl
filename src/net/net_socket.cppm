@@ -4,9 +4,10 @@
 module;
 #include <util/noncopyable.h>
 
-export module socket:raii;
+export module etsl.net:socket;
 
-import net;
+import :defs;
+import :ops;
 
 export namespace etsl
 {

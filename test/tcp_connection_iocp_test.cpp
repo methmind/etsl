@@ -14,10 +14,7 @@
 #include <thread>
 #include <vector>
 
-import reactor;
-import timer;
-import net;
-import net.tcp_connection;
+import etsl;
 
 namespace {
 
@@ -698,6 +695,7 @@ TEST_F(TCPConnectionIOCPTest, DoubleDisposeInvokesOnDisposedOnce)
     EXPECT_EQ(disposedCount_, 1);
 }
 
+
 TEST_F(TCPConnectionIOCPTest, ConnectToListeningPeerInvokesOnConnectSuccess)
 {
     LocalListener listener;
@@ -713,7 +711,11 @@ TEST_F(TCPConnectionIOCPTest, ConnectToListeningPeerInvokesOnConnectSuccess)
         accepted.store(listener.Accept(2000));
     });
 
-    ASSERT_TRUE(driver_->connect(addr).has_value());
+    const auto connectResult = driver_->connect(addr);
+    ASSERT_TRUE(connectResult.has_value())
+        << "connect error: " << connectResult.error()
+        << ", family=" << static_cast<int>(addr.data().sa_family)
+        << ", size=" << addr.size() << ", port=" << listener.Port();
     RunReactor();
     acceptThread.join();
 

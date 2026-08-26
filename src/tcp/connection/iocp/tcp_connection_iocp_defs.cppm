@@ -4,7 +4,7 @@
 module;
 #include <etl/span.h>
 
-export module net.tcp_connection:defs_iocp;
+export module etsl.tcp.connection:defs_iocp;
 
 namespace etsl
 {

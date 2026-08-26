@@ -7,10 +7,9 @@ module;
 
 #include "etl/expected.h"
 
-module reactor;
+module etsl.reactor;
 
 import :iocp;
-import win.wsa;
 
 namespace etsl
 {
@@ -25,11 +24,6 @@ namespace etsl
     {
         if (this->iocp_ != nullptr) {
             return {};
-        }
-
-        static C_WSAInitializer wsa;
-        if (const auto res = wsa.initialize(); !res) {
-            return etl::unexpected(res.error());
         }
 
         this->iocp_ = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);

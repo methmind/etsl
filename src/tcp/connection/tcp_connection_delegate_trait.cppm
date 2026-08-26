@@ -4,7 +4,7 @@
 module;
 #include <concepts>
 
-module net.tcp_connection:delegate;
+module etsl.tcp.connection:delegate;
 
 import :defs;
 

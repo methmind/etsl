@@ -4,7 +4,7 @@
 module;
 #include <etl/expected.h>
 
-export module net:address;
+export module etsl.net:address;
 
 import :defs;
 

@@ -2,7 +2,7 @@
 // Created by sexey on 24.08.2026.
 //
 
-export module net.tcp_acceptor;
+export module etsl.tcp.acceptor;
 
 export import :defs;
 

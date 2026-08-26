@@ -5,7 +5,7 @@ module;
 #include <winsock2.h>
 #include "etl/expected.h"
 
-export module win.wsa;
+export module etsl.init:wsa;
 
 export namespace etsl
 {

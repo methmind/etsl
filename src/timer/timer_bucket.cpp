@@ -8,7 +8,9 @@ module;
 #include <etl/algorithm.h>
 #include <etl/chrono.h>
 
-module timer.bucket;
+module etsl.timer;
+
+import :bucket;
 
 namespace etsl
 {

@@ -10,11 +10,10 @@ module;
 
 #include <util/noncopyable.h>
 
-export module net.tcp_acceptor:iocp;
+export module etsl.tcp.acceptor:iocp;
 
-import net;
-import socket;
-import reactor;
+import etsl.net;
+import etsl.reactor;
 
 import :defs;
 
