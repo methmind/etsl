@@ -45,7 +45,6 @@ target_sources(etsl_core
         src/reactor/reactor_trait.cppm
         src/reactor/iocp/reactor_iocp.cppm
         src/reactor/iocp/reactor_iocp_defs.cppm
-        src/init/wsa/wsa_initializer.cppm
         src/net/net.cppm
         src/net/net_defs.cppm
         src/net/net_ops.cppm
@@ -65,15 +64,20 @@ target_sources(etsl_core
         src/timer/timer_impl.cppm
         src/timer/timer_defs.cppm
         src/init/initializer.cppm
-        src/init/win/win_initializer.cppm
     PRIVATE
         src/reactor/iocp/reactor_iocp.cpp
-        src/init/wsa/wsa_initializer.cpp
         src/timer/timer_bucket.cpp
         src/util/etl_chrono.cpp
-        src/net/net_ops.cpp
         src/net/net_address.cpp
 )
+
+if(WIN32)
+    target_sources(etsl_core PRIVATE
+        src/init/win/win_initializer.cpp
+        src/net/win/net_ops_win.cpp
+        src/net/win/net_socket_factory_win.cpp
+    )
+endif()
 
 target_include_directories(etsl_core PUBLIC
     "${CMAKE_CURRENT_SOURCE_DIR}"

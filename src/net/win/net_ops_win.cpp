@@ -2,15 +2,8 @@
 // Created by sexey on 20.07.2026.
 //
 module;
-#if defined(_WIN32)
 #include <winsock2.h>
 #include <ws2tcpip.h>
-#elif defined(__linux__)
-#include <sys/socket.h>
-#include <netinet/in.h>
-#else
-#error "Unsupported platform"
-#endif
 
 #include <etl/expected.h>
 #include <etl/endianness.h>

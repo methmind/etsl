@@ -18,8 +18,8 @@
     ETSL_NON_MOVABLE(ClassName);
 
 #define ETSL_DEFAULT_NON_COPYABLE_NON_MOVABLE(ClassName) \
-    ClassName() = default; \
-    ~ClassName() = default; \
+    ClassName() noexcept = default; \
+    ~ClassName() noexcept = default; \
     ETSL_NON_COPYABLE_NON_MOVABLE(ClassName)
 
 #endif //ETSL_NONCOPYABLE_H

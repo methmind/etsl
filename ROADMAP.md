@@ -53,8 +53,10 @@
   нет, — деплой падает до ручной правки пути.
 - MSVC (`cl`) **не поддерживается** и не планируется; проект ориентирован
   исключительно на Clang.
-- ETL 20.47.1 (`external/etl`, submodule). Исключения внутри ETL выключены по
-  умолчанию (`ETL_THROW_EXCEPTIONS` не определён, `external/etl/include/etl/platform.h:264`)
+- ETL 20.48.1 (`external/etl`, submodule; обновлён с 20.47.1 и застейджен
+  28.08.2026 — бамп уменьшил MinSizeRel-dec на 1 472 байта, см. ADR-9).
+  Исключения внутри ETL выключены по умолчанию (`ETL_THROW_EXCEPTIONS`
+  не определён, `external/etl/include/etl/platform.h:287`)
   — дополнительных макросов для ETL не нужно; нужно лишь компилировать сам проект
   без исключений.
 - CMake ≥ 4.2, `CMAKE_CXX_SCAN_FOR_MODULES ON`. Модули перечислены в
@@ -244,7 +246,17 @@ Baseline для сопоставления с июльской серией — 
 Статическая CRT — цена самодостаточного exe, а не роста библиотеки; выбор
 рантайма остаётся за владельцем toolchain. Замер после реструктуризации 2.7
 (25.08.2026): dec **96 371** (−720 к baseline — переезд и префиксы имён
-модулей размера не добавили).
+модулей размера не добавили). Замер 28.08.2026 (разделение ос-шин net/init
+на `<os>/` impl-юниты, см. §4/§7.4): dec **97 299**, при этом вклад самого
+разделения — **0 байт** (в каталогах сборки одинаковой длины пути HEAD и
+разделение дают идентичный dec 97 251, .text совпадает байт-в-байт).
+Прирост к эталону 96 371 разлагается на: ~+2,4 КБ — пост-замерные изменения
+дерева, вошедшие в коммит 728756e (timer-реструктуризация, модуль init,
+акцептор); −1 472 — незакоммиченный бамп сабмодуля ETL 20.47.1 → 20.48.1.
+Метрический артефакт `dec`: для PE колонка text включает .rdata с absolute-
+путём к PDB (debug-директория) — длина имени каталога сборки сама по себе
+меняет dec (~50 байт, UTF-8 кириллица = 2 байта/символ); сравнивать сборки
+из каталогов одинаковой длины пути.
 
 ### ADR-10. Структура — вертикальные фича-компоненты; `platform/` ликвидируется (25.08.2026)
 
@@ -303,21 +315,27 @@ umbrella слой не заслуживает (`etsl.net:socket`/`etsl.net:facto
 
 ---
 
-## 4. Структура модулей (фактическая после 2.7, обновлено 25.08.2026)
+## 4. Структура модулей (фактическая после 2.7, обновлено 28.08.2026)
 
 ```
 src/
 ├── etsl.cppm                         # module etsl — umbrella: export import
 │                                     # всех публичных модулей (import etsl;)
+├── init/                             # инициализация подсистемы (etsl.init)
+│   ├── initializer.cppm              # контракт: декларация Initialize(), без ОС
+│   └── win/                          # impl-юнит: WSAStartup/WSACleanup
+│                                     # (C_WSAInitializer — module-local)
 ├── net/                              # словарь сети + ос-шины, без фич внутри
 │   ├── net.cppm                      # etsl.net: export import :defs :ops
 │   │                                 # :address :socket :factory
 │   ├── net_defs.cppm                 # socket_t, INVALID_SOCKET, sockaddr-алиасы
-│   ├── net_ops.cppm/.cpp             # ParseIPV4, CloseSocket, Shutdown,
-│   │                                 # GetExtensionFunction — ос-шины (GMF)
+│   ├── net_ops.cppm                  # декларации ParseIPV4, CloseSocket,
+│   │                                 # Shutdown, GetExtensionFunction
 │   ├── net_address.cppm/.cpp         # C_Address
 │   ├── net_socket.cppm               # etsl.net:socket — C_Socket (RAII)
-│   └── net_socket_factory.cppm       # etsl.net:factory — CreateSocket
+│   ├── net_socket_factory.cppm       # etsl.net:factory — декларация CreateSocket
+│   └── win/                          # impl-юниты ос-шин: net_ops_win,
+│                                     # net_socket_factory_win; linux/ — Этап 4
 ├── tcp/                              # транспорт-фича над net+reactor
 │   ├── connection/                   # контракт в корне, бекенды — в <os>/
 │   │   ├── tcp_connection.cppm                 # etsl.tcp.connection — alias C_TCPConnection<T>
@@ -333,8 +351,7 @@ src/
 │   ├── reactor_trait.cppm            # concept ReactorTrait: initialize/run/
 │   │                                 # shutdown/associate/detach/post/
 │   │                                 # addTimer/removeTimer
-│   └── iocp/                         # reactor_iocp* + wsa_initializer (win.wsa);
-│                                     # epoll/ — Этап 4
+│   └── iocp/                         # reactor_iocp*; epoll/ — Этап 4
 ├── timer/                            # etsl.timer, etsl.timer:types,
 │                                     # etsl.timer.bucket — пользовательские
 │                                     # таймеры реактора (ADR-2)
@@ -344,7 +361,12 @@ test/tcp_connection_iocp_test.cpp  # gtest-набор соединения (30 �
 ```
 
 Соглашения: имя файла модуля == имя модуля; `export module <domain>[.<sub>]`;
-namespace `etsl`; классы с префиксом `C_`, методы `snake_case`. Запланированные
+namespace `etsl`; классы с префиксом `C_`, методы `snake_case`. Ос-шины свободных
+функций (`etsl.init`, `etsl.net:ops`/`:factory`, 28.08.2026) оформлены паттерном
+«контракт + impl-юнит»: `.cppm` — только декларации (ноль ifdef в телах), тела —
+в `<feature>/<os>/*.cpp` (`module <mod>;`), файл выбирает CMake по платформе
+(`if(WIN32)`-блок); umbrella `#ifdef → export import :iocp` — только для модулей,
+экспортирующих типы (tcp, reactor). Запланированные
 ранее `core/error.cppm`, `socket/socket_address`, `socket/tcp_socket`,
 `socket/tcp_write_request` не появились: их роли заняли `net:*`,
 делегатный контракт соединения и `send_operation_t` (ADR-2/ADR-3).
@@ -586,8 +608,10 @@ baseline размера зафиксирован.
       `onReadyRead` (синхронный `read()` в колбэке); active write продолжать
       по `EPOLLOUT`, отключая interest после терминального `onCommit`;
       тот же `TCPConnectionDelegate`-контракт, что у IOCP-реализации.
-- [ ] **4.3** `reactor/iocp/wsa_initializer` (`win.wsa`) — на Linux отсутствует;
-      `CloseSocket` → `::close`; `last_error()` → `errno`.
+- [ ] **4.3** Linux-тела ос-шин: `src/init/linux/` (Initialize → true) и
+      `src/net/linux/` (`CloseSocket` → `::close`, berkeley-тела `ParseIPV4`/
+      `CreateSocket`, ошибки — `errno`); включение — else-веткой `if(WIN32)`-блока
+      CMakeLists (паттерн «контракт + impl-юнит», см. §4).
 - [ ] **4.4** CI/пресет Linux-сборки; прогон gtest-набора + echo на обеих ОС.
 
 **DoD:** user-код examples идентичен на обеих платформах; отличия — только
@@ -602,12 +626,14 @@ baseline размера зафиксирован.
    `std::function`, `std::error_code`, `iostream`, `printf`-логирование.
 3. `noexcept` по умолчанию на всех публичных функциях; ошибки — только через
    `etl::expected` (ADR-6).
-4. ОС-специфичный код — только в партициях `<feature>/<os>/` (`reactor/iocp/`,
-   `tcp/connection/iocp/`, `tcp/acceptor/iocp/`, …) и в ос-шинах
-   (`etsl.net:defs`, `etsl.net:ops`, `etsl.net:factory` — ветвление в global
-   module fragment). Контрактные модули (defs, delegate-концепты) не содержат
-   вызовов ОС; alias-umbrella выбирает бекенд по `_WIN32`/`__linux__`.
-   Пользовательский делегат платформенно-нейтрален (ADR-3, ADR-10).
+4. ОС-специфичный код — только в `<feature>/<os>/` (`reactor/iocp/`,
+   `tcp/connection/iocp/`, `init/win/`, `net/win/`, …). Бекенды с типами —
+   партиции с alias-umbrella по `_WIN32`/`__linux__`; ос-шины свободных функций —
+   паттерн «контракт + impl-юнит» (декларации в `.cppm`, тела в `<os>/*.cpp`,
+   выбор файла — `if(WIN32)`-блоком CMake; исключение — `etsl.net:defs`,
+   ветвление в global module fragment). Контрактные модули (defs,
+   delegate-концепты) не содержат вызовов ОС. Пользовательский делегат
+   платформенно-нейтрален (ADR-3, ADR-10).
 5. Read-probe — ровно один pending OVERLAPPED на сокет; send-операций может
    быть несколько, каждая со своим caller-owned OVERLAPPED (ADR-2/ADR-4);
    лайфтайм по ADR-5.
