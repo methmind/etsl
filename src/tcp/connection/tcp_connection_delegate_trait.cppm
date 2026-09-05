@@ -3,6 +3,7 @@
 //
 module;
 #include <concepts>
+#include <cstdint>
 
 module etsl.tcp.connection:delegate;
 

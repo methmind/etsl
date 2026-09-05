@@ -10,7 +10,8 @@ export import :defs;
 import :iocp;
 export namespace etsl
 {
-    using C_TCPAcceptor = C_TCPAcceptorIOCP;
+    template<typename T>
+    using C_TCPAcceptor = C_TCPAcceptorIOCP<T>;
 }
 #elif defined(__linux__)
 #error "Linux tcp socket driver is not implemented yet"

@@ -15,117 +15,251 @@ export module etsl.tcp.acceptor:iocp;
 import etsl.net;
 import etsl.reactor;
 
-import :defs;
+import :delegate;
+import :defs_iocp;
+
+#define FlushOperation(operation) memset(static_cast<WSAOVERLAPPED*>(&(operation)), 0, sizeof(WSAOVERLAPPED))
 
 export namespace etsl
 {
+    template<typename delegate_t>
     class C_TCPAcceptorIOCP
     {
     public:
-        ~C_TCPAcceptorIOCP() noexcept = default;
+        using accept_operation_t = accept_operation_s;
 
-        explicit C_TCPAcceptorIOCP(C_Reactor& reactor) noexcept : reactor_(reactor), gateway_(INVALID_SOCKET) {}
+        ~C_TCPAcceptorIOCP() noexcept { assert(this->backlog_.empty() && "UAF error caught!"); }
+
+        explicit C_TCPAcceptorIOCP(C_Reactor& reactor, etl::ipool& backlog, delegate_t& delegate) noexcept;
 
         ETSL_NON_COPYABLE_NON_MOVABLE(C_TCPAcceptorIOCP);
 
-        etl::expected<void, int32_t> initialize(const C_Address& addr) noexcept
-        {
-            auto gate = CreateSocket();
-            if (!gate) {
-                return etl::unexpected(gate.error());
-            }
+        void dispose() noexcept { beginTeardown(); }
 
-            if (bind(gate->get(), &addr.data(), static_cast<int32_t>(addr.size())) == SOCKET_ERROR) {
-                return etl::unexpected(WSAGetLastError());
-            }
+        [[nodiscard]] etl::expected<void, int32_t> initialize(const C_Address& addr) noexcept;
 
-            if (const auto err = this->reactor_.associate(gate->get()); !err) {
-                return etl::unexpected(err.error());
-            }
-
-            this->gateway_ = std::move(*gate);
-            return {};
-        }
-
-        etl::expected<void, int32_t> listen(int32_t backlog) noexcept
-        {
-            if (::listen(this->gateway_.get(), backlog) == SOCKET_ERROR) {
-                return etl::unexpected(WSAGetLastError());
-            }
-
-            for (auto i = 0; i < this->pool_.capacity(); ++i) {
-                if (const auto err = postAccept(); !err) {
-                    return etl::unexpected(err.error());
-                }
-            }
-
-            return {};
-        }
+        [[nodiscard]] etl::expected<void, int32_t> listen(int32_t backlog) noexcept;
 
     private:
-        static etl::expected<void, int32_t> AcceptEx(socket_t gateway, const accept_operation_t& operation) noexcept
-        {
-            static auto getResult{GetExtensionFunction(gateway, WSAID_ACCEPTEX)};
-            if (!getResult) {
-                return etl::unexpected(getResult.error());
-            }
+        [[nodiscard]] static etl::expected<void, int32_t> AcceptEx(socket_t gateway,
+            accept_operation_t& operation) noexcept;
 
-            DWORD tmp = 0;
-            const auto acceptEx = static_cast<LPFN_ACCEPTEX>(*getResult);
-            if (!acceptEx(gateway, operation.fd.get(), (void*)&operation.buffer, 0,
-                ACCEPT_BUFFER_SIZE,
-                ACCEPT_BUFFER_SIZE, &tmp, (WSAOVERLAPPED*)&operation)) {
-                if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
-                    return etl::unexpected(err);
-                }
-            }
+        [[nodiscard]] etl::expected<void, int32_t> rearmAcceptOperation(accept_operation_t& operation) noexcept;
 
-            return {};
+        [[nodiscard]] etl::expected<void, int32_t> armAcceptBacklog() noexcept;
+
+        void beginTeardown() noexcept;
+
+        void onConnectionIncoming(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept;
+
+        void onDisposeOperation() noexcept;
+
+        C_Reactor& reactor_;
+        C_Reactor::dispose_operation_t disposeOperation_{};
+
+        C_Socket gateway_;
+        tcp_acceptor_state_e state_;
+
+        delegate_t& delegate_;
+        etl::ipool& backlog_;
+    };
+
+    template<typename delegate_t>
+    C_TCPAcceptorIOCP<delegate_t>::C_TCPAcceptorIOCP(C_Reactor& reactor, etl::ipool& backlog, delegate_t& delegate) noexcept :
+        reactor_(reactor), gateway_(INVALID_SOCKET), state_(tcp_acceptor_state_e::NONE), delegate_(delegate), backlog_(backlog)
+    {
+        static_assert(TCPAcceptorDelegate<delegate_t>, "Delegate must satisfy tcp acceptor delegate trait!");
+
+        this->disposeOperation_.callback = decltype(this->disposeOperation_.callback)::template create<
+            C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onDisposeOperation>(*this);
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::initialize(const C_Address& addr) noexcept
+    {
+        if (!this->backlog_.capacity()) {
+            return etl::unexpected(static_cast<int32_t>(ERROR_NOT_ENOUGH_MEMORY));
         }
 
-        etl::expected<void, int32_t> postAccept() noexcept
-        {
-            const auto operation = this->pool_.create();
-            if (!operation) {
+        if (this->backlog_.max_item_size() != sizeof(accept_operation_t)) {
+            return etl::unexpected(static_cast<int32_t>(MEM_E_INVALID_SIZE));
+        }
+
+        if (this->state_ != tcp_acceptor_state_e::NONE) {
+            return etl::unexpected(WSAEALREADY);
+        }
+
+        auto gate = CreateSocket();
+        if (!gate) {
+            return etl::unexpected(gate.error());
+        }
+
+        int32_t exclusiveAddrUse = 1;
+        if (setsockopt(gate->get(), SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+            reinterpret_cast<const char*>(&exclusiveAddrUse), sizeof(exclusiveAddrUse)) == SOCKET_ERROR) {
+            return etl::unexpected(WSAGetLastError());
+        }
+
+        if (bind(gate->get(), &addr.data(), static_cast<int32_t>(addr.size())) == SOCKET_ERROR) {
+            return etl::unexpected(WSAGetLastError());
+        }
+
+        if (const auto err = this->reactor_.associate(gate->get()); !err) {
+            return etl::unexpected(err.error());
+        }
+
+        this->gateway_ = std::move(*gate);
+        return {};
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::listen(int32_t backlog) noexcept
+    {
+        if (this->state_ != tcp_acceptor_state_e::NONE || !this->gateway_.is_valid()) {
+            return etl::unexpected(WSAEINVAL);
+        }
+
+        auto fallback = [this](int32_t err) -> etl::expected<void, int32_t> {
+            this->state_ = tcp_acceptor_state_e::NONE;
+            this->gateway_.dispose();
+
+            return etl::unexpected(err);
+        };
+
+        if (::listen(this->gateway_.get(), backlog) == SOCKET_ERROR) {
+            return fallback(WSAGetLastError());
+        }
+
+        this->state_ = tcp_acceptor_state_e::LISTENING;
+        if (const auto err = armAcceptBacklog(); !err) {
+            return fallback(err.error());
+        }
+
+        return {};
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::AcceptEx(socket_t gateway,
+        accept_operation_t& operation) noexcept
+    {
+        static auto getResult{GetExtensionFunction(gateway, WSAID_ACCEPTEX)};
+        if (!getResult) {
+            return etl::unexpected(getResult.error());
+        }
+
+        DWORD tmp = 0;
+        const auto acceptEx = reinterpret_cast<LPFN_ACCEPTEX>(*getResult);
+        if (!acceptEx(gateway, operation.fd.get(), static_cast<void*>(&operation.buffer), 0,
+            ACCEPT_BUFFER_SIZE, ACCEPT_BUFFER_SIZE, &tmp, static_cast<WSAOVERLAPPED*>(&operation))) {
+            if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
+                return etl::unexpected(err);
+            }
+        }
+
+        return {};
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::rearmAcceptOperation(accept_operation_t& operation) noexcept
+    {
+        if (this->state_ != tcp_acceptor_state_e::LISTENING) {
+            return etl::unexpected(WSAEINVAL);
+        }
+
+        auto newDescriptor = CreateSocket();
+        if (!newDescriptor) {
+            return etl::unexpected(newDescriptor.error());
+        }
+
+        FlushOperation(operation);
+        operation.fd = std::move(*newDescriptor);
+        operation.callback = decltype(accept_operation_t::callback)::create<
+           C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onConnectionIncoming>(*this);
+
+        if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
+            return etl::unexpected(err.error());
+        }
+
+        return {};
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::armAcceptBacklog() noexcept
+    {
+        while (this->backlog_.size() < this->backlog_.capacity()) {
+            auto destructor = [backlog = &backlog_](auto ptr) -> void {
+                backlog->destroy<accept_operation_t>(ptr);
+            };
+
+            auto operation = etl::unique_ptr<accept_operation_t, decltype(destructor)>(this->backlog_.create<accept_operation_t>(), destructor);
+            /*if (!operation) { Impossible???
                 return etl::unexpected(static_cast<int32_t>(ERROR_NOT_ENOUGH_MEMORY));
-            }
+            }*/
 
-            auto newFD = CreateSocket();
-            if (!newFD) {
-                return etl::unexpected(newFD.error());
-            }
-
-            operation->fd = std::move(*newFD);
-            operation->callback = decltype(accept_operation_t::callback)::create<
-                C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onClientAccepted>(*this);
-
-            if (const auto err = AcceptEx(this->gateway_.get(), *operation); !err) {
+            if (const auto err = rearmAcceptOperation(*operation); !err) {
                 return etl::unexpected(err.error());
             }
 
-            return {};
+            operation.release();
         }
 
-        void onClientAccepted(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept
-        {
-            auto& casted = reinterpret_cast<accept_operation_t&>(operation);
-            auto newFD = std::move(casted.fd);
-            this->pool_.destroy(&casted);
+        return {};
+    }
 
-            if (error != ERROR_SUCCESS) {
-                //todo begin teardown...
-                return;
-            }
-
-            if (const auto err = postAccept(); !err && err.error() != ERROR_NOT_ENOUGH_MEMORY) {
-                //todo begin teardown...
-                return;
-            }
+    template<typename delegate_t>
+    void C_TCPAcceptorIOCP<delegate_t>::beginTeardown() noexcept
+    {
+        if (this->gateway_.is_valid()) {
+            this->gateway_.dispose();
         }
 
-        C_Reactor& reactor_;
-        C_Socket gateway_;
+        this->state_ = tcp_acceptor_state_e::DISPOSING;
+        if (!this->backlog_.empty()) {
+            return;
+        }
 
-        etl::pool<accept_operation_t, 32> pool_;
-    };
+        if (this->disposeOperation_.is_linked()) {
+            return;
+        }
+
+        this->reactor_.detach(this->disposeOperation_);
+    }
+
+    template<typename delegate_t>
+    void C_TCPAcceptorIOCP<delegate_t>::onConnectionIncoming(C_Reactor::operation_t& operation,
+        uint32_t /*transferred*/, int32_t error) noexcept
+    {
+        auto& acceptOperation = reinterpret_cast<accept_operation_t&>(operation);
+        auto incomingDescriptor = std::move(acceptOperation.fd);
+        auto fallback = [this](int32_t err, accept_operation_t&& op) -> void {
+            /* @note
+             * Если операция была отменена (без установления флага разрушения) - это следствие ошибки в armAcceptBacklog.
+             * Часть операций AcceptEx уже была "взведена", но остальная провалилась и теперь нам прилетают отмены.
+            */
+            if (err != ERROR_OPERATION_ABORTED && this->state_ == tcp_acceptor_state_e::NONE) {
+                beginTeardown();
+            }
+
+            this->backlog_.destroy<accept_operation_t>(&op);
+        };
+
+        if (this->state_ == tcp_acceptor_state_e::DISPOSING || error == ERROR_OPERATION_ABORTED) {
+            fallback(ERROR_OPERATION_ABORTED, std::move(acceptOperation));
+            return;
+        }
+
+        this->delegate_.onIncoming(std::move(incomingDescriptor));
+        if (const auto err = rearmAcceptOperation(acceptOperation); !err) {
+            fallback(err.error(), std::move(acceptOperation));
+        }
+    }
+
+    template<typename delegate_t>
+    void C_TCPAcceptorIOCP<delegate_t>::onDisposeOperation() noexcept
+    {
+        assert(this->backlog_.empty() && "Dangling operations!");
+
+        this->state_ = tcp_acceptor_state_e::NONE;
+        this->delegate_.onDisposed();
+    }
 }

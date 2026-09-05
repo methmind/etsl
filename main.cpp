@@ -1,6 +1,7 @@
 #include <cstdint>
 #include <winsock2.h>
 #include <etl/pool.h>
+#include <util/noncopyable.h>
 
 #include "etl/expected.h"
 
@@ -8,14 +9,21 @@ import etsl;
 
 const char* hello_world = "Hello, Server!\r\n";
 
-class C_Test
+class C_Test : etsl::C_TCPConnection<C_Test>
 {
 public:
+    friend etsl::C_TCPConnection<C_Test>;
+
     ~C_Test() noexcept = default;
 
-    explicit C_Test(etsl::C_Reactor& reactor) noexcept :
-        reactor_(reactor), driver_(reactor, *this) {}
+    explicit C_Test(etsl::C_Reactor& reactor) noexcept : etsl::C_TCPConnection<C_Test>(reactor, *this), reactor_(reactor) {}
 
+    auto exec(const etsl::C_Address& addr) noexcept
+    {
+        return connect(addr);
+    }
+
+private:
     void onConnect(int32_t error) noexcept
     {
         return;
@@ -24,11 +32,11 @@ public:
     void onReadyRead() noexcept
     {
         char test[261]{};
-        if (const auto err = this->driver_.read({(uint8_t*)&test, sizeof(test)}); !err) {
+        if (const auto err = read({(uint8_t*)&test, sizeof(test)}); !err) {
             return;
         }
 
-        if (const auto err = this->driver_.send({(uint8_t*)hello_world, strlen(hello_world)},
+        if (const auto err = send({(uint8_t*)hello_world, strlen(hello_world)},
             this->sendOperation_); !err) {
             return;
         }
@@ -51,16 +59,32 @@ public:
         return;
     }
 
-    auto exec(const etsl::C_Address& addr) noexcept
-    {
-        return this->driver_.connect(addr);
-    }
+    etsl::C_Reactor& reactor_;
+    etsl::send_operation_t sendOperation_{};
+};
+
+class C_Server : public etsl::C_TCPAcceptor<C_Server>
+{
+public:
+    friend etsl::C_TCPAcceptor<C_Server>;
+
+    ~C_Server() noexcept = default;
+
+    explicit C_Server(etsl::C_Reactor& reactor) noexcept :
+        etsl::C_TCPAcceptor<C_Server>(reactor, backlog, *this) {}
 
 private:
-    etsl::C_Reactor& reactor_;
-    etsl::C_TCPConnection<C_Test> driver_;
+    void onIncoming(etsl::C_Socket fd) noexcept
+    {
+        return;
+    }
 
-    etsl::send_operation_t sendOperation_{};
+    void onDisposed() noexcept
+    {
+        return;
+    }
+
+    etl::pool<accept_operation_t, 1> backlog{};
 };
 
 int main()
@@ -79,12 +103,12 @@ int main()
         return err.error();
     }
 
-    etsl::C_TCPAcceptor acceptor(reactor);
-    if (const auto err = acceptor.initialize(gateAddr); !err) {
+    C_Server server(reactor);
+    if (const auto err = server.initialize(gateAddr); !err) {
         return err.error();
     }
 
-    if (const auto err = acceptor.listen(SOMAXCONN); !err) {
+    if (const auto err = server.listen(SOMAXCONN); !err) {
         return err.error();
     }
 

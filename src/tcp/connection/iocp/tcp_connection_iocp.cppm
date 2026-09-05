@@ -76,7 +76,7 @@ export namespace etsl
 
         C_Socket fd_;
         tcp_connection_state_e state_;
-        uint32_t pendingOps_;
+        uint16_t pendingOps_;
 
         bool wasConnected_;
         int32_t cachedDisposeReason_;
@@ -91,10 +91,10 @@ export namespace etsl
     {
         static_assert(TCPConnectionDelegate<delegate_t>, "Delegate must satisfy tcp connection delegate trait!");
 
-        this->readinessOperation_.callback = decltype(this->readinessOperation_.callback)::template create<
+        this->readinessOperation_.callback = decltype(C_Reactor::operation_t::callback)::create<
             C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onReadinessOperation>(*this);
 
-        this->disposeOperation_.callback = decltype(this->disposeOperation_.callback)::template create<
+        this->disposeOperation_.callback = decltype(C_Reactor::dispose_operation_t::callback)::create<
             C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onDisposeOperation>(*this);
     }
 
@@ -102,7 +102,7 @@ export namespace etsl
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::connect(const C_Address& addr) noexcept
     {
         if (this->state_ != tcp_connection_state_e::NONE || this->pendingOps_) {
-            return etl::unexpected(static_cast<int32_t>(WSAEALREADY));
+            return etl::unexpected(WSAEALREADY);
         }
 
         auto socketCreateResult = CreateSocket();
@@ -128,7 +128,7 @@ export namespace etsl
             return etl::unexpected(WSAENOTCONN);
         }
 
-        auto fail = [this](int32_t err) -> etl::expected<uint32_t, int32_t> {
+        auto fallback = [this](int32_t err) -> etl::expected<uint32_t, int32_t> {
             beginTeardown(err);
             return etl::unexpected(err);
         };
@@ -139,11 +139,11 @@ export namespace etsl
         }
 
         if (res == 0) {
-            return fail(0);
+            return fallback(0);
         }
 
         if (const auto err = WSAGetLastError(); err != WSAEWOULDBLOCK) {
-            return fail(err);
+            return fallback(err);
         }
 
         return 0;
@@ -174,7 +174,7 @@ export namespace etsl
             return etl::unexpected(getResult.error());
         }
 
-        const auto connectEx = static_cast<LPFN_CONNECTEX>(*getResult);
+        const auto connectEx = reinterpret_cast<LPFN_CONNECTEX>(*getResult);
         if (!connectEx(fd, &addr.data(), static_cast<int32_t>(addr.size()), nullptr, 0, nullptr, &completion)) {
             if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
                 return etl::unexpected(err);
@@ -211,7 +211,7 @@ export namespace etsl
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::createReadProbeOperation() noexcept
     {
         if (this->state_ != tcp_connection_state_e::CONNECTED) {
-            return etl::unexpected(static_cast<int32_t>(WSAEINVAL));
+            return etl::unexpected(WSAEINVAL);
         }
 
         DWORD flags = 0;
@@ -232,7 +232,7 @@ export namespace etsl
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::createSendOperation(send_operation_t& operation) noexcept
     {
         if (this->state_ != tcp_connection_state_e::CONNECTED) {
-            return etl::unexpected(static_cast<int32_t>(WSAEINVAL));
+            return etl::unexpected(WSAEINVAL);
         }
 
         FlushOperation(operation);
@@ -281,7 +281,7 @@ export namespace etsl
     template<typename delegate_t>
     void C_TCPConnectionIOCP<delegate_t>::onConnectRoutine() noexcept
     {
-        if (setsockopt(this->fd_.get(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) != ERROR_SUCCESS) {
+        if (setsockopt(this->fd_.get(), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) == SOCKET_ERROR) {
             beginTeardown(WSAGetLastError());
             return;
         }
@@ -321,7 +321,7 @@ export namespace etsl
                 onReadRoutine();
                 break;
             case tcp_connection_state_e::DISPOSING:
-                beginTeardown(this->cachedDisposeReason_);
+                beginTeardown(0); // Тут код ошибки не важен (ибо уже кешировано), но указать что-то надо.
                 break;
             default:
                 assert(false && "Invalid state!");

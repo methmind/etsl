@@ -541,6 +541,19 @@ baseline размера зафиксирован.
       `C_TCPAcceptorIOCP` — пул posted `AcceptEx` на `etl::pool` (32),
       repost из completion; teardown-пути и делегатные колбэки (`onIncoming`)
       ещё не заведены (todo в коде); `main.cpp` упражняет acceptor вручную.*
+      *Дополнено (28.08.2026): акцептор доведён до полной аналогии с connection
+      (ADR-3/ADR-5) — делегатная модель `C_TCPAcceptorIOCP<delegate_t>` + концепт
+      `TCPAcceptorDelegate` (`onIncoming(C_Socket)` — сокет по значению,
+      `onDisposed()`), teardown через `pendingOps_` + `disposeOperation_`
+      (`dispose()` → `beginTeardown()` → терминальный `onDisposed()` при любом
+      пути сноса), `SO_EXCLUSIVEADDRUSE` перед bind, `SO_UPDATE_ACCEPT_CONTEXT`
+      на принятом сокете, `FlushOperation` (memset `WSAOVERLAPPED`) перед
+      взводом, очистка слота пула на путях отказа, буфер адресов переведён на
+      `(sizeof(sockaddr_storage)+16)*2`; state-машина `tcp_acceptor_state_e`
+      (NONE/LISTENING/DISPOSING) в партиции `:defs_iocp`. Кросс-сборка Debug
+      зелёная, деплой на ВМ и короткий smoke-прогон (4 c, Debug-ассерты включены)
+      без падений; `[x]` не ставится до прогона под нагрузкой (echo, 2.5) —
+      gtest-покрытия акцептора пока нет.*
 - [ ] **2.5** `examples/echo_client.cpp` + `examples/echo_server.cpp`; гонка
       ≥ 64 МБ без потерь/рассинхрона; зафиксировать размер sample:
       `echo_server: ___ КБ` → установить бюджет.
