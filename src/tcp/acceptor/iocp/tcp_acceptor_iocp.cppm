@@ -34,7 +34,7 @@ export namespace etsl
 
         ETSL_NON_COPYABLE_NON_MOVABLE(C_TCPAcceptorIOCP);
 
-        void dispose() noexcept { beginTeardown(); }
+        void dispose() noexcept { beginTeardown(EXPLICIT_DISPOSE); }
 
         [[nodiscard]] etl::expected<void, int32_t> initialize(const C_Address& addr) noexcept;
 
@@ -48,7 +48,7 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<void, int32_t> armAcceptBacklog() noexcept;
 
-        void beginTeardown() noexcept;
+        void beginTeardown(int32_t reason) noexcept;
 
         void onConnectionIncoming(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept;
 
@@ -60,13 +60,16 @@ export namespace etsl
         C_Socket gateway_;
         tcp_acceptor_state_e state_;
 
+        int32_t cachedDisposeReason_;
+
         delegate_t& delegate_;
         etl::ipool& backlog_;
     };
 
     template<typename delegate_t>
     C_TCPAcceptorIOCP<delegate_t>::C_TCPAcceptorIOCP(C_Reactor& reactor, etl::ipool& backlog, delegate_t& delegate) noexcept :
-        reactor_(reactor), gateway_(INVALID_SOCKET), state_(tcp_acceptor_state_e::NONE), delegate_(delegate), backlog_(backlog)
+        reactor_(reactor), gateway_(INVALID_SOCKET), state_(tcp_acceptor_state_e::NONE),
+        cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate), backlog_(backlog)
     {
         static_assert(TCPAcceptorDelegate<delegate_t>, "Delegate must satisfy tcp acceptor delegate trait!");
 
@@ -123,7 +126,16 @@ export namespace etsl
             this->state_ = tcp_acceptor_state_e::NONE;
             this->gateway_.dispose();
 
-            return etl::unexpected(err);
+            /* @note
+             * Ни одна AcceptEx не взведена - акцептор не начал работу. Отдаём код ошибки
+             * синхронно; терминального колбэка не будет.
+            */
+            if (this->backlog_.empty()) {
+                return etl::unexpected(err);
+            }
+
+            beginTeardown(err);
+            return {};
         };
 
         if (::listen(this->gateway_.get(), backlog) == SOCKET_ERROR) {
@@ -207,8 +219,12 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPAcceptorIOCP<delegate_t>::beginTeardown() noexcept
+    void C_TCPAcceptorIOCP<delegate_t>::beginTeardown(int32_t reason) noexcept
     {
+        if (this->cachedDisposeReason_ == INVALID_CACHE_VALUE || reason == EXPLICIT_DISPOSE) {
+            this->cachedDisposeReason_ = reason;
+        }
+
         if (this->gateway_.is_valid()) {
             this->gateway_.dispose();
         }
@@ -230,27 +246,22 @@ export namespace etsl
         uint32_t /*transferred*/, int32_t error) noexcept
     {
         auto& acceptOperation = reinterpret_cast<accept_operation_t&>(operation);
-        auto incomingDescriptor = std::move(acceptOperation.fd);
-        auto fallback = [this](int32_t err, accept_operation_t&& op) -> void {
-            /* @note
-             * Если операция была отменена (без установления флага разрушения) - это следствие ошибки в armAcceptBacklog.
-             * Часть операций AcceptEx уже была "взведена", но остальная провалилась и теперь нам прилетают отмены.
-            */
-            if (err != ERROR_OPERATION_ABORTED && this->state_ == tcp_acceptor_state_e::NONE) {
-                beginTeardown();
-            }
-
+        auto fallback = [this](int32_t err, const accept_operation_t& op) -> void {
             this->backlog_.destroy<accept_operation_t>(&op);
+            beginTeardown(err);
         };
 
-        if (this->state_ == tcp_acceptor_state_e::DISPOSING || error == ERROR_OPERATION_ABORTED) {
-            fallback(ERROR_OPERATION_ABORTED, std::move(acceptOperation));
+        if (this->state_ == tcp_acceptor_state_e::DISPOSING) {
+            fallback(ERROR_OPERATION_ABORTED, acceptOperation);
             return;
         }
 
-        this->delegate_.onIncoming(std::move(incomingDescriptor));
+        if (error == ERROR_SUCCESS) {
+            this->delegate_.onIncoming(std::move(acceptOperation.fd));
+        }
+
         if (const auto err = rearmAcceptOperation(acceptOperation); !err) {
-            fallback(err.error(), std::move(acceptOperation));
+            fallback(err.error(), acceptOperation);
         }
     }
 
@@ -259,7 +270,10 @@ export namespace etsl
     {
         assert(this->backlog_.empty() && "Dangling operations!");
 
+        const auto stackReason = this->cachedDisposeReason_;
         this->state_ = tcp_acceptor_state_e::NONE;
-        this->delegate_.onDisposed();
+        this->cachedDisposeReason_ = INVALID_CACHE_VALUE;
+
+        this->delegate_.onDisposed(stackReason);
     }
 }

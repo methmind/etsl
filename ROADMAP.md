@@ -554,6 +554,21 @@ baseline размера зафиксирован.
       зелёная, деплой на ВМ и короткий smoke-прогон (4 c, Debug-ассерты включены)
       без падений; `[x]` не ставится до прогона под нагрузкой (echo, 2.5) —
       gtest-покрытия акцептора пока нет.*
+      *Дополнено (05.09.2026): teardown акцептора получил код причины по образцу
+      ADR-5 — `beginTeardown(int32_t reason)` с кешем `cachedDisposeReason_`
+      (первая причина побеждает, `EXPLICIT_DISPOSE` перебивает всегда; роль
+      `pendingOps_` играет `backlog_.size()`), терминальный колбэк концепта стал
+      `onDisposed(int32_t reason)`. Константы `EXPLICIT_DISPOSE`/
+      `INVALID_CACHE_VALUE` продублированы в `etsl.tcp.acceptor:defs_iocp`, чтобы
+      партиции connection и acceptor оставались независимыми. `listen()` теперь
+      различает два отказа `armAcceptBacklog`: полный (пул пуст — синхронный
+      `etl::unexpected(err)`, объект чист, колбэка нет) и частичный (часть
+      `AcceptEx` в полёте — `listen()` возвращает успех, внутри стартует
+      `beginTeardown(err)`, причина доезжает отложенно в `onDisposed`). Прежняя
+      эвристика `state_ == NONE` в `onConnectionIncoming` удалена; заодно
+      completion с ошибкой, отличной от `ERROR_OPERATION_ABORTED` (напр. RST пира
+      до accept), больше не отдаёт делегату негодный сокет, а просто перевзводит
+      слот.*
 - [ ] **2.5** `examples/echo_client.cpp` + `examples/echo_server.cpp`; гонка
       ≥ 64 МБ без потерь/рассинхрона; зафиксировать размер sample:
       `echo_server: ___ КБ` → установить бюджет.

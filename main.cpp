@@ -79,7 +79,7 @@ private:
         return;
     }
 
-    void onDisposed() noexcept
+    void onDisposed(int32_t reason) noexcept
     {
         return;
     }
