@@ -20,6 +20,25 @@ namespace etsl
         }
     }
 
+    void C_ReactorIOCP::FlushOperation(operation_t& operation) noexcept
+    {
+        memset(&operation, 0, sizeof(WSAOVERLAPPED));
+    }
+
+    int32_t C_ReactorIOCP::TranslateError(const C_Socket& fd, const operation_t& operation, int32_t iocpError) noexcept
+    {
+        if (iocpError == ERROR_SUCCESS) {
+            return iocpError;
+        }
+
+        DWORD flags = 0, transferred = 0;
+        if (WSAGetOverlappedResult(fd.get(), const_cast<LPOVERLAPPED>(static_cast<const WSAOVERLAPPED*>(&operation)), &transferred, false, &flags)) {
+            return iocpError; // Расхождение с реактором, но остаёмся пессимистами.
+        }
+
+        return WSAGetLastError();
+    }
+
     etl::expected<void, int32_t> C_ReactorIOCP::initialize() noexcept
     {
         if (this->iocp_ != nullptr) {
@@ -77,6 +96,7 @@ namespace etsl
 
             const auto timeout = (this->disposable_.empty()) ? this->timerBucket_.nextTimeout(clock_t::now()) : 0;
             const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, timeout);
+            const auto ioError = (ioStatus) ? 0 : static_cast<int32_t>(GetLastError());
 
             const auto currentTime = clock_t::now();
             while (const auto timer = this->timerBucket_.pop(currentTime)) {
@@ -85,12 +105,11 @@ namespace etsl
 
             if (overlapped) {
                 const auto operation = reinterpret_cast<operation_t*>(overlapped);
-                operation->callback(*operation, bytesTransferred, ioStatus ? 0 : static_cast<int32_t>(GetLastError()));
+                operation->callback(*operation, bytesTransferred, ioError);
             }
 
-            while (!this->disposable_.empty()) {
-                this->disposable_.back().callback();
-                this->disposable_.pop_back();
+            while (const auto disposable = popDisposable()) {
+                disposable->callback();
             }
         }
     }
@@ -99,5 +118,17 @@ namespace etsl
     {
         this->halt_ = true;
         PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN), nullptr);
+    }
+
+    const C_ReactorIOCP::dispose_operation_t* C_ReactorIOCP::popDisposable() noexcept
+    {
+        if (this->disposable_.empty()) {
+            return nullptr;
+        }
+
+        const auto ptr = &this->disposable_.front();
+        this->disposable_.pop_front();
+
+        return ptr;
     }
 }

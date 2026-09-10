@@ -20,11 +20,11 @@ namespace etsl
             return etl::unexpected(WSAGetLastError());
         }
 
-        u_long value = 1;
-        if (ioctlsocket(sock.get(), FIONBIO, &value) == SOCKET_ERROR) {
-            return etl::unexpected(WSAGetLastError());
+        if (const auto err = SetNonBlocking(sock.get()); !err) {
+            return etl::unexpected(err.error());
         }
 
+        constexpr u_long value = 0;
         if (setsockopt(sock.get(), IPPROTO_TCP, TCP_NODELAY,
             reinterpret_cast<const char*>(&value), sizeof(value)) == SOCKET_ERROR) {
             return etl::unexpected(WSAGetLastError());

@@ -42,6 +42,16 @@ namespace etsl
         return shutdown(fd, static_cast<int32_t>(mode)) != SOCKET_ERROR;
     }
 
+    etl::expected<void, int32_t> SetNonBlocking(socket_t fd) noexcept
+    {
+        u_long value = 1;
+        if (ioctlsocket(fd, FIONBIO, &value) == SOCKET_ERROR) {
+            return etl::unexpected(WSAGetLastError());
+        }
+
+        return {};
+    }
+
     etl::expected<void*, int32_t> GetExtensionFunction(socket_t fd, GUID guid) noexcept
     {
         DWORD bytes = 0;

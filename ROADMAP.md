@@ -39,7 +39,7 @@
 
 ---
 
-## 2. Окружение и сборка (обновлено 2026-08-20)
+## 2. Окружение и сборка (обновлено 07.09.2026)
 
 - Основной режим — **кросс-компиляция из Linux под Windows**: toolchain
   `~/Документы/toolchain/windows-clang.cmake` (clang, target
@@ -62,11 +62,12 @@
 - CMake ≥ 4.2, `CMAKE_CXX_SCAN_FOR_MODULES ON`. Модули перечислены в
   `FILE_SET CXX_MODULES` в `CMakeLists.txt` — **каждый новый модуль добавлять туда**.
 - **Тесты:** GoogleTest v1.17.0 (FetchContent), опция `ETSL_BUILD_TESTS`; набор
-  `test/tcp_connection_iocp_test.cpp` — 30 тестов, Windows/IOCP-only (на
+  `test/tcp_connection_iocp_test.cpp` — 35 тестов, Windows/IOCP-only (на
   не-Windows сборка suite отключена). Из-за `CMAKE_CROSSCOMPILING` тест
   регистрируется одним `add_test` без `gtest_discover_tests`; прогон —
-  скопировать exe на ВМ и запустить. *(25.08.2026: прогон падает на 3-м
-  тесте — см. D10; поведение идентично до и после реструктуризации 2.7).*
+  скопировать exe на ВМ и запустить. *(07.09.2026: прогон 35/35 PASSED после
+  закрытия D10; рост с 30 тестов — покрытие adopt, empty-span send,
+  read-WOULDBLOCK.)*
 
 Команды:
 
@@ -100,7 +101,7 @@ demultiplexer/completion backend. Transport-specific OS operations находя�
 association/completion, но reactor не зависит от connection. Размещение
 platform connection в `reactor` или `socket` запрещено.
 
-### ADR-2. Полу-проактивная модель I/O (пересмотрено 2026-08-20)
+### ADR-2. Полу-проактивная модель I/O (пересмотрено 2026-08-20 и 07.09.2026)
 
 Идея приводить IOCP к чисто реактивному (readiness) режиму отвергнута, как и
 эмуляция readiness таймерами. Принята полу-проактивная модель:
@@ -108,11 +109,15 @@ platform connection в `reactor` или `socket` запрещено.
 - **Чтение:** на сокет взводится ровно один pending **0-byte `WSARecv`**
   (read-probe). Его completion означает «данные доступны» и транслируется в
   `onReadyRead()`. Пользователь читает синхронно из колбэка: `read(span)` →
-  `recv`; `WSAEWOULDBLOCK` → возвращается 0 (вычитано всё); `0` → EOF →
-  teardown → `onDisconnect(0)`. После возврата `onReadyRead()` проба взводится
-  заново — level-triggered семантика, пейсинг через async completion, busy loop
-  невозможен. `MSG_PEEK`-фильтрация удалена: на IOCP probe срабатывает на
-  реальный приём, EOF детектится через `read() == 0`.
+  `recv`; success-канал несёт только реальный счётчик прочитанных байтов;
+  `WSAEWOULDBLOCK` → `unexpected(WSAEWOULDBLOCK)` без teardown («данных нет»;
+  пересмотрено 07.09.2026 — прежде возвращался success 0); `recv() == 0` →
+  EOF → teardown → `onDisconnect(0)`; прочие ошибки `recv` → teardown +
+  информационный sync-код, терминальный колбэк доедет отложенно. После
+  возврата `onReadyRead()` проба взводится заново — level-triggered
+  семантика, пейсинг через async completion, busy loop невозможен.
+  `MSG_PEEK`-фильтрация удалена: на IOCP probe срабатывает на реальный приём,
+  EOF детектится через `read()` → `unexpected(0)`.
 - **Запись (полностью проактивная):** `send(span, send_operation_t&)` немедленно
   порождает `WSASend`; частичные завершения соединение дозавершает сам
   (`transferred +=`, досылка остатка). Каждая операция — caller-owned контекст
@@ -121,7 +126,12 @@ platform connection в `reactor` или `socket` запрещено.
   терминальным `onCommit(operation, error)`. Порядок доставки гарантирует TCP
   (порядок вызовов `WSASend` на сокете). FIFO, TX ring buffer и timer backoff
   в соединении отсутствуют — очередь операций при необходимости держит
-  пользователь. На epoll write продолжается по `EPOLLOUT` (Этап 4).
+  пользователь. Контракт ошибок (07.09.2026): usage-отказы — `WSAEINVAL`
+  (пустой span) и `WSAENOTCONN` (не `CONNECTED`) — синхронный `unexpected`
+  без side-эффектов; синхронный отказ взвода `WSASend` терминален:
+  `beginTeardown` + информационный sync-код, операция не взведена, `onCommit`
+  по ней не придёт (симметрично терминальным отказам `read`). На epoll write
+  продолжается по `EPOLLOUT` (Этап 4).
 - **Accept/Connect:** эмуляция не нужна — `AcceptEx`/`ConnectEx` нативно
   completion-based; их завершение мапится прямо в `onIncoming`/`onConnect`.
 - **Контракт association:** generic reactor только связывает fd с backend.
@@ -149,7 +159,10 @@ IOCP reactor доставляет raw completion делегату операци
 конструкторе соединения):
 
 - `onConnect(int32_t error)` — завершение `ConnectEx` (или неудачный коннект
-  после teardown);
+  после teardown). `adopt()` его не вызывает: сокет принят уже подключённым,
+  вызывающий знает это синхронно, — первое событие делегата принятого сокета
+  `onReadyRead` либо `onDisconnect`, в т.ч. `onDisconnect(err)` при неудаче
+  взвода read-пробы внутри `adopt` (07.09.2026);
 - `onReadyRead()` — данные доступны; пользователь зовёт `read(span)`;
 - `onCommit(operation_t&, int32_t error)` — терминальное завершение
   send-операции, включая отменённую (`ERROR_OPERATION_ABORTED` при dispose —
@@ -378,7 +391,7 @@ namespace `etsl`; классы с префиксом `C_`, методы `snake_c
 
 ---
 
-## 5. Известные дефекты (обновлено 2026-08-20)
+## 5. Известные дефекты (обновлено 07.09.2026)
 
 D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оставлены как история.
 
@@ -387,16 +400,27 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   Закомментированная обёртка `#if(WIN32)` оставлена сознательно: хук нужен
   именно при кросс-сборке из Linux.
 
-- **D10** *(открыт, найден 25.08.2026)*: gtest-набор падает на 3-м тесте
-  `ConnectToListeningPeerInvokesOnConnectSuccess` — `connect(addr)` возвращает
-  ошибку (код не логируется), после ASSERT-провала процесс завершается
-  (код 3). Воспроизводится в Debug и MinSizeRel и **идентично до и после
-  реструктуризации 2.7** (проверено прогонами обоих состояний дерева на ВМ) —
-  дефект предсуществующий: внесён WIP-правками после зелёного прогона 20.08
-  (правки `net_ops`/`net_address`, работа над акцептором) либо изменившимся
-  окружением ВМ. Первые два теста (dispose-контракт) зелёные. Диагностика:
-  вывести код ошибки из `connect()` (CreateSocket / associate / EphemeralBind /
-  ConnectEx).
+- **D10** *(закрыт 07.09.2026)*: gtest-набор падал на 3-м тесте
+  `ConnectToListeningPeerInvokesOnConnectSuccess` — `connect(addr)` возвращал
+  ошибку, после ASSERT-провала процесс завершался (код 3). Воспроизводился в
+  Debug и MinSizeRel, идентично до и после реструктуризации 2.7. Причина
+  подтвердилась в `net_ops` (как и предполагалось): `ParseIPV4`,
+  `net_ops_win.cpp:25` — `auto sa = reinterpret_cast<os_sockaddr_in_t&>(
+  storage)` (auto без `&`): вывод типа отбрасывал ссылку, `sa` был стековой
+  копией — family/port/`inet_pton` писались в копию, `storage` вызывающего
+  оставался нулевым, connect уходил на нулевой адрес. Фикс: `auto& sa = ...`.
+  Прогон после фикса и рефакторинга контракта соединения: **35/35 PASSED**
+  (07.09.2026).
+
+- **D11** *(открыт, найден 07.09.2026)*: акцептор не ставит
+  `SO_UPDATE_ACCEPT_CONTEXT` на принятый сокет — запись 2.4 от 28.08
+  утверждает обратное, код ей не соответствует. Острота со стороны connection
+  снята (07.09.2026): `adopt()` больше не применяет
+  `SO_UPDATE_CONNECT_CONTEXT` (опция осталась только на пути `ConnectEx` —
+  `applyConnection`), невалидная для AcceptEx-сокета опция не ставится.
+  Перенос обновления контекста принятых сокетов на сторону акцептора (нужен
+  дескриптор листенера — есть только у акцептора) — вопрос дизайна акцептора,
+  за владельцем.
 
 - **D1.** `#if defined(WINNT)` — `WINNT` определяет **только MinGW**-тулчейн
   (проверено препроцессором); MSVC его не определяет → под `cl` ветка уходит в

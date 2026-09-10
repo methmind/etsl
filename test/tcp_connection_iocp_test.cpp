@@ -18,6 +18,22 @@ import etsl;
 
 namespace {
 
+// The library no longer initializes Winsock implicitly: etsl::Initialize() is
+// the user-side entry point. Run it once for the whole test process.
+class WinEnvironment final : public ::testing::Environment
+{
+public:
+    void SetUp() override
+    {
+        // Unbuffered stdout: gtest messages survive an abort() mid-test.
+        (void)setvbuf(stdout, nullptr, _IONBF, 0);
+        ASSERT_TRUE(etsl::Initialize());
+    }
+};
+
+[[maybe_unused]] static const auto* const g_winEnv =
+    ::testing::AddGlobalTestEnvironment(new WinEnvironment);
+
 class LocalListener
 {
 public:
@@ -266,13 +282,14 @@ public:
     {
         readyReadCount_++;
 
-        constexpr uint32_t kReadFailed = UINT32_MAX;
         while (payloadLen_ < static_cast<int>(sizeof(payload_))) {
+            // value_or(0): operator* is broken under -fno-exceptions; unexpected
+            // (WOULDBLOCK drained / EOF / IO error — the latter two start teardown) → 0 → stop.
             const uint32_t n = driver_->read({
                 reinterpret_cast<uint8_t*>(payload_ + payloadLen_),
                 sizeof(payload_) - payloadLen_
-            }).value_or(kReadFailed);
-            if (n == kReadFailed || n == 0) {
+            }).value_or(0);
+            if (n == 0) {
                 break;
             }
             payloadLen_ += static_cast<int>(n);
@@ -332,6 +349,7 @@ public:
     using C_Reactor = etsl::C_Reactor;
     using C_Timer = etsl::C_Timer;
     using send_operation_t = etsl::send_operation_t;
+    using C_Socket = etsl::C_Socket;
     using Driver = etsl::C_TCPConnection<TCPConnectionIOCPTest>;
 
     void onReadyRead() noexcept
@@ -341,23 +359,21 @@ public:
         if (captureReadyReadPayload_) {
             capturedPayloadLen_ = 0;
             while (capturedPayloadLen_ < static_cast<int>(sizeof(capturedPayload_))) {
-                // value_or: avoid etl::expected<uint32_t>::operator* (broken under -fno-exceptions).
-                constexpr uint32_t kReadFailed = UINT32_MAX;
+                // value_or(0): operator* is broken under -fno-exceptions; unexpected
+                // (WOULDBLOCK drained / EOF / IO error — the latter two start teardown) → 0 → stop.
                 const uint32_t n = driver_->read({
                     reinterpret_cast<uint8_t*>(capturedPayload_ + capturedPayloadLen_),
                     static_cast<size_t>(sizeof(capturedPayload_) - capturedPayloadLen_)
-                }).value_or(kReadFailed);
-                if (n == kReadFailed || n == 0) {
+                }).value_or(0);
+                if (n == 0) {
                     break;
                 }
                 capturedPayloadLen_ += static_cast<int>(n);
             }
         } else if (consumeReadyRead_) {
             uint8_t buf[64];
-            constexpr uint32_t kReadFailed = UINT32_MAX;
             while (true) {
-                const uint32_t n = driver_->read({buf, sizeof(buf)}).value_or(kReadFailed);
-                if (n == kReadFailed || n == 0) {
+                if (driver_->read({buf, sizeof(buf)}).value_or(0) == 0) {
                     break;
                 }
             }
@@ -591,6 +607,34 @@ protected:
     [[nodiscard]] bool MakeAddress(const uint16_t port, C_Address& out) noexcept
     {
         return out.initialize("127.0.0.1", port).has_value();
+    }
+
+    // Blocking connect to a live listener, then nonblocking mode: a socket ready
+    // for C_TCPConnectionIOCP::adopt() (acceptor hands out sockets like this).
+    [[nodiscard]] static bool MakeConnectedSocket(const LocalListener& listener, C_Socket& out) noexcept
+    {
+        const SOCKET raw = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        if (raw == INVALID_SOCKET) {
+            return false;
+        }
+
+        sockaddr_in dst{};
+        dst.sin_family = AF_INET;
+        dst.sin_port = htons(listener.Port());
+        if (::inet_pton(AF_INET, "127.0.0.1", &dst.sin_addr) != 1
+            || ::connect(raw, reinterpret_cast<sockaddr*>(&dst), sizeof(dst)) == SOCKET_ERROR) {
+            ::closesocket(raw);
+            return false;
+        }
+
+        u_long nonblocking = 1;
+        if (::ioctlsocket(raw, FIONBIO, &nonblocking) == SOCKET_ERROR) {
+            ::closesocket(raw);
+            return false;
+        }
+
+        out = C_Socket(raw);
+        return true;
     }
 
     void PrepareSend(send_operation_t& operation, uint8_t* data, const size_t len) noexcept
@@ -1289,7 +1333,7 @@ TEST_F(TCPConnectionIOCPTest, ReadBeforeConnectReturnsNotConn)
     EXPECT_EQ(result.error(), static_cast<int32_t>(WSAENOTCONN));
 }
 
-TEST_F(TCPConnectionIOCPTest, SendBeforeConnectReturnsInvalid)
+TEST_F(TCPConnectionIOCPTest, SendBeforeConnectReturnsNotConn)
 {
     uint8_t bytes[] = {'x'};
     send_operation_t op{};
@@ -1297,11 +1341,11 @@ TEST_F(TCPConnectionIOCPTest, SendBeforeConnectReturnsInvalid)
 
     const auto result = driver_->send(op.content, op);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAENOTCONN));
     EXPECT_EQ(commitCount_, 0);
 }
 
-TEST_F(TCPConnectionIOCPTest, SendAfterDisconnectReturnsInvalid)
+TEST_F(TCPConnectionIOCPTest, SendAfterDisconnectReturnsNotConn)
 {
     LocalListener listener;
     ASSERT_TRUE(listener.Start());
@@ -1338,11 +1382,11 @@ TEST_F(TCPConnectionIOCPTest, SendAfterDisconnectReturnsInvalid)
 
     const auto result = driver_->send(op.content, op);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAENOTCONN));
     EXPECT_EQ(commitCount_, 0);
 }
 
-TEST_F(TCPConnectionIOCPTest, SendAfterDisposeReturnsInvalid)
+TEST_F(TCPConnectionIOCPTest, SendAfterDisposeReturnsNotConn)
 {
     stopOnDisposed_ = true;
     driver_->dispose();
@@ -1355,8 +1399,193 @@ TEST_F(TCPConnectionIOCPTest, SendAfterDisposeReturnsInvalid)
 
     const auto result = driver_->send(op.content, op);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAENOTCONN));
     EXPECT_EQ(commitCount_, 0);
+}
+
+TEST_F(TCPConnectionIOCPTest, SendEmptyWhileConnectedReturnsInvalid)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Address addr;
+    ASSERT_TRUE(MakeAddress(listener.Port(), addr));
+
+    send_operation_t emptyOp{};
+    sendOnConnect_ = &emptyOp;
+    disposeOnConnect_ = true;
+
+    std::thread acceptThread([&] {
+        (void)listener.Accept(2000);
+    });
+
+    ASSERT_TRUE(driver_->connect(addr).has_value());
+    RunReactor();
+    acceptThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(sendOnConnectAttempted_);
+    EXPECT_FALSE(sendOnConnectOk_);
+    EXPECT_EQ(sendOnConnectError_, static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(commitCount_, 0);
+    EXPECT_EQ(disposedCount_, 1);
+}
+
+TEST_F(TCPConnectionIOCPTest, AdoptConnectedSocketReceivesPeerData)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Socket fd;
+    ASSERT_TRUE(MakeConnectedSocket(listener, fd));
+
+    const auto adopted = driver_->adopt(std::move(fd));
+    ASSERT_TRUE(adopted.has_value()) << "adopt error: " << adopted.error();
+
+    static constexpr char kPayload[] = "adopted";
+    static constexpr int kPayloadLen = static_cast<int>(sizeof(kPayload) - 1);
+
+    captureReadyReadPayload_ = true;
+    disposeOnReadyRead_ = true;
+
+    std::atomic<bool> sent{false};
+    std::thread peerThread([&] {
+        const SOCKET a = listener.AcceptRaw(2000);
+        if (a == INVALID_SOCKET) {
+            return;
+        }
+        sent.store(listener.SendAllOn(a, kPayload, kPayloadLen));
+    });
+
+    RunReactor();
+    peerThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(sent.load());
+    ASSERT_GE(readyReadCount_, 1);
+    ASSERT_EQ(capturedPayloadLen_, kPayloadLen);
+    EXPECT_EQ(std::memcmp(capturedPayload_, kPayload, static_cast<size_t>(kPayloadLen)), 0);
+    EXPECT_EQ(disposedCount_, 1);
+    EXPECT_EQ(disconnectCount_, 0);
+}
+
+TEST_F(TCPConnectionIOCPTest, AdoptedSocketSendsAndPeerReceives)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Socket fd;
+    ASSERT_TRUE(MakeConnectedSocket(listener, fd));
+
+    const auto adopted = driver_->adopt(std::move(fd));
+    ASSERT_TRUE(adopted.has_value()) << "adopt error: " << adopted.error();
+
+    static constexpr char kPayload[] = "pushed";
+    static constexpr int kPayloadLen = static_cast<int>(sizeof(kPayload) - 1);
+    uint8_t bytes[kPayloadLen];
+    std::memcpy(bytes, kPayload, sizeof(bytes));
+
+    // Adopted connection is CONNECTED synchronously: send right away, no onConnect.
+    send_operation_t op{};
+    PrepareSend(op, bytes, sizeof(bytes));
+    const auto sent = driver_->send(op.content, op);
+    ASSERT_TRUE(sent.has_value()) << "send error: " << sent.error();
+
+    disposeAfterCommits_ = 1;
+
+    char received[kPayloadLen]{};
+    std::atomic<bool> gotPayload{false};
+    std::thread peerThread([&] {
+        const SOCKET a = listener.AcceptRaw(2000);
+        if (a == INVALID_SOCKET) {
+            return;
+        }
+        gotPayload.store(listener.RecvExactOn(a, received, kPayloadLen));
+    });
+
+    RunReactor();
+    peerThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(gotPayload.load());
+    ASSERT_EQ(commitCount_, 1);
+    EXPECT_EQ(lastCommitError_, 0);
+    EXPECT_EQ(op.transferred, static_cast<uint32_t>(kPayloadLen));
+    EXPECT_EQ(disposedCount_, 1);
+}
+
+TEST_F(TCPConnectionIOCPTest, AdoptWhileConnectedReturnsIsConn)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Socket fd1;
+    C_Socket fd2;
+    ASSERT_TRUE(MakeConnectedSocket(listener, fd1));
+    ASSERT_TRUE(MakeConnectedSocket(listener, fd2));
+
+    ASSERT_TRUE(driver_->adopt(std::move(fd1)).has_value());
+
+    const auto again = driver_->adopt(std::move(fd2));
+    ASSERT_FALSE(again.has_value());
+    EXPECT_EQ(again.error(), static_cast<int32_t>(WSAEISCONN));
+
+    stopOnDisposed_ = true;
+    driver_->dispose();
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_EQ(disposedCount_, 1);
+}
+
+// WOULDBLOCK is an explicit "no more data" answer: not a success value, but
+// also not a teardown — the connection must stay fully operational afterwards.
+TEST_F(TCPConnectionIOCPTest, ReadWithoutDataReturnsWouldBlockConnectionStaysAlive)
+{
+    LocalListener listener;
+    ASSERT_TRUE(listener.Start());
+
+    C_Socket fd;
+    ASSERT_TRUE(MakeConnectedSocket(listener, fd));
+
+    const auto adopted = driver_->adopt(std::move(fd));
+    ASSERT_TRUE(adopted.has_value());
+
+    // Nothing was sent by the peer yet: read must report WOULDBLOCK and keep
+    // the connection alive (no teardown, no onDisconnect).
+    uint8_t buf[8]{};
+    const auto empty = driver_->read({buf, sizeof(buf)});
+    ASSERT_FALSE(empty.has_value());
+    EXPECT_EQ(empty.error(), static_cast<int32_t>(WSAEWOULDBLOCK));
+    EXPECT_EQ(disconnectCount_, 0);
+    EXPECT_EQ(disposedCount_, 0);
+
+    // The connection is still operational: peer data is delivered and readable.
+    static constexpr char kPayload[] = "alive";
+    static constexpr int kPayloadLen = static_cast<int>(sizeof(kPayload) - 1);
+
+    captureReadyReadPayload_ = true;
+    disposeOnReadyRead_ = true;
+
+    std::atomic<bool> sent{false};
+    std::thread peerThread([&] {
+        const SOCKET a = listener.AcceptRaw(2000);
+        if (a == INVALID_SOCKET) {
+            return;
+        }
+        sent.store(listener.SendAllOn(a, kPayload, kPayloadLen));
+    });
+
+    RunReactor();
+    peerThread.join();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(sent.load());
+    ASSERT_GE(readyReadCount_, 1);
+    ASSERT_EQ(capturedPayloadLen_, kPayloadLen);
+    EXPECT_EQ(std::memcmp(capturedPayload_, kPayload, static_cast<size_t>(kPayloadLen)), 0);
+    EXPECT_EQ(disposedCount_, 1);
+    EXPECT_EQ(disconnectCount_, 0);
 }
 
 TEST_F(TCPConnectionIOCPTest, SendAfterConnectInvokesOnCommitAndDeliversPayload)
@@ -1540,9 +1769,11 @@ TEST_F(TCPConnectionIOCPTest, TwoDriversOnSameReactorOperateIndependently)
     C_Address addr;
     ASSERT_TRUE(MakeAddress(listener.Port(), addr));
 
-    static constexpr char kFirstPayload[] = "first";
-    uint8_t firstBytes[sizeof(kFirstPayload) - 1];
-    std::memcpy(firstBytes, kFirstPayload, sizeof(firstBytes));
+    // Equal-length connect-time tags let the peer identify connections by
+    // content instead of accept order (accept order races with ConnectEx).
+    static constexpr char kFirstTag[] = "FIX1";
+    uint8_t firstBytes[sizeof(kFirstTag) - 1];
+    std::memcpy(firstBytes, kFirstTag, sizeof(firstBytes));
 
     send_operation_t first{};
     PrepareSend(first, firstBytes, sizeof(firstBytes));
@@ -1555,8 +1786,6 @@ TEST_F(TCPConnectionIOCPTest, TwoDriversOnSameReactorOperateIndependently)
     SecondPeerDelegate second(reactor_, &disposedCount_);
     peerDelegate_ = &second;
 
-    // Connect the fixture driver first: the peer thread identifies connections
-    // by accept order, and ConnectEx issues SYNs in call order on loopback.
     ASSERT_TRUE(driver_->connect(addr).has_value());
     second.Start(addr);
 
@@ -1567,24 +1796,29 @@ TEST_F(TCPConnectionIOCPTest, TwoDriversOnSameReactorOperateIndependently)
             return;
         }
 
-        char firstReceived[sizeof(kFirstPayload) - 1];
-        char secondReceived[4];
-        if (!listener.RecvExactOn(a, firstReceived, static_cast<int>(sizeof(firstReceived)))) {
-            return;
-        }
-        if (!listener.RecvExactOn(b, secondReceived, sizeof(secondReceived))) {
+        char tagA[4];
+        char tagB[4];
+        if (!listener.RecvExactOn(a, tagA, sizeof(tagA)) || !listener.RecvExactOn(b, tagB, sizeof(tagB))) {
             return;
         }
 
-        payloadsOk.store(std::memcmp(firstReceived, kFirstPayload, sizeof(firstReceived)) == 0
-            && std::memcmp(secondReceived, "2nd!", sizeof(secondReceived)) == 0);
+        const bool aIsFirst = std::memcmp(tagA, kFirstTag, sizeof(tagA)) == 0;
+        const bool bIsFirst = std::memcmp(tagB, kFirstTag, sizeof(tagB)) == 0;
+        if (!aIsFirst && !bIsFirst) {
+            return;
+        }
 
-        (void)listener.SendAllOn(a, "echoA", 5);
-        (void)listener.SendAllOn(b, "echoB", 5);
-        ::shutdown(a, SD_BOTH);
-        ::closesocket(a);
-        ::shutdown(b, SD_BOTH);
-        ::closesocket(b);
+        const SOCKET firstSock = aIsFirst ? a : b;
+        const SOCKET secondSock = aIsFirst ? b : a;
+
+        (void)listener.SendAllOn(firstSock, "echoA", 5);
+        (void)listener.SendAllOn(secondSock, "echoB", 5);
+        ::shutdown(firstSock, SD_BOTH);
+        ::closesocket(firstSock);
+        ::shutdown(secondSock, SD_BOTH);
+        ::closesocket(secondSock);
+
+        payloadsOk.store(true);
     });
 
     RunReactor();
@@ -1611,7 +1845,7 @@ TEST_F(TCPConnectionIOCPTest, TwoDriversOnSameReactorOperateIndependently)
     EXPECT_TRUE(payloadsOk.load());
 }
 
-TEST_F(TCPConnectionIOCPTest, SendWhileConnectingReturnsInvalid)
+TEST_F(TCPConnectionIOCPTest, SendWhileConnectingReturnsNotConn)
 {
     LocalListener listener;
     ASSERT_TRUE(listener.Start());
@@ -1632,7 +1866,7 @@ TEST_F(TCPConnectionIOCPTest, SendWhileConnectingReturnsInvalid)
     PrepareSend(op, bytes, sizeof(bytes));
     const auto result = driver_->send(op.content, op);
     ASSERT_FALSE(result.has_value());
-    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAEINVAL));
+    EXPECT_EQ(result.error(), static_cast<int32_t>(WSAENOTCONN));
 
     RunReactor();
     acceptThread.join();

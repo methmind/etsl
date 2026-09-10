@@ -31,6 +31,8 @@ export namespace etsl
 
     bool Shutdown(socket_t fd, socket_shutdown_e mode) noexcept;
 
+    etl::expected<void, int32_t> SetNonBlocking(socket_t fd) noexcept;
+
 #if defined(_WIN32)
     etl::expected<void*, int32_t> GetExtensionFunction(socket_t fd, GUID guid) noexcept;
 #endif

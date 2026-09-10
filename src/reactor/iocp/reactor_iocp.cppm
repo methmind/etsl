@@ -25,6 +25,10 @@ export namespace etsl
         ~C_ReactorIOCP() noexcept;
         C_ReactorIOCP() noexcept : halt_(false), iocp_(nullptr) {}
 
+        static void FlushOperation(operation_t& operation) noexcept;
+
+        static int32_t TranslateError(const C_Socket& fd, const operation_t& operation, int32_t iocpError) noexcept;
+
         [[nodiscard]] etl::expected<void, int32_t> initialize() noexcept;
 
         [[nodiscard]] etl::expected<void, int32_t> associate(socket_t fd) noexcept;
@@ -42,6 +46,8 @@ export namespace etsl
         void shutdown() noexcept;
 
     private:
+        [[nodiscard]] const dispose_operation_t *popDisposable() noexcept;
+
         bool halt_;
         HANDLE iocp_;
 

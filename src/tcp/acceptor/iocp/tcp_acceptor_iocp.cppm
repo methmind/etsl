@@ -18,8 +18,6 @@ import etsl.reactor;
 import :delegate;
 import :defs_iocp;
 
-#define FlushOperation(operation) memset(static_cast<WSAOVERLAPPED*>(&(operation)), 0, sizeof(WSAOVERLAPPED))
-
 export namespace etsl
 {
     template<typename delegate_t>
@@ -50,7 +48,9 @@ export namespace etsl
 
         void beginTeardown(int32_t reason) noexcept;
 
-        void onConnectionIncoming(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept;
+        void acceptIncoming(C_Socket&& fd) noexcept;
+
+        void onIncoming(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept;
 
         void onDisposeOperation() noexcept;
 
@@ -125,12 +125,11 @@ export namespace etsl
         auto fallback = [this](int32_t err) -> etl::expected<void, int32_t> {
             this->state_ = tcp_acceptor_state_e::NONE;
             this->gateway_.dispose();
-
-            /* @note
-             * Ни одна AcceptEx не взведена - акцептор не начал работу. Отдаём код ошибки
-             * синхронно; терминального колбэка не будет.
-            */
             if (this->backlog_.empty()) {
+                /* @note
+                 * Ни одна AcceptEx не взведена - акцептор не начал работу. Отдаём код ошибки
+                 * Терминального колбэка не будет.
+                */
                 return etl::unexpected(err);
             }
 
@@ -183,10 +182,10 @@ export namespace etsl
             return etl::unexpected(newDescriptor.error());
         }
 
-        FlushOperation(operation);
+        C_Reactor::FlushOperation(operation);
         operation.fd = std::move(*newDescriptor);
         operation.callback = decltype(accept_operation_t::callback)::create<
-           C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onConnectionIncoming>(*this);
+           C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this);
 
         if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
             return etl::unexpected(err.error());
@@ -242,7 +241,18 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPAcceptorIOCP<delegate_t>::onConnectionIncoming(C_Reactor::operation_t& operation,
+    void C_TCPAcceptorIOCP<delegate_t>::acceptIncoming(C_Socket&& fd) noexcept
+    {
+        socket_t listening = this->gateway_.get();
+        if (setsockopt(fd.get(), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, reinterpret_cast<char*>(&listening), sizeof(listening)) == SOCKET_ERROR) {
+            return;
+        }
+
+        this->delegate_.onIncoming(std::move(fd));
+    }
+
+    template<typename delegate_t>
+    void C_TCPAcceptorIOCP<delegate_t>::onIncoming(C_Reactor::operation_t& operation,
         uint32_t /*transferred*/, int32_t error) noexcept
     {
         auto& acceptOperation = reinterpret_cast<accept_operation_t&>(operation);
@@ -252,12 +262,12 @@ export namespace etsl
         };
 
         if (this->state_ == tcp_acceptor_state_e::DISPOSING) {
-            fallback(ERROR_OPERATION_ABORTED, acceptOperation);
+            fallback(C_Reactor::TranslateError(acceptOperation.fd, operation, error), acceptOperation);
             return;
         }
 
         if (error == ERROR_SUCCESS) {
-            this->delegate_.onIncoming(std::move(acceptOperation.fd));
+            acceptIncoming(std::move(acceptOperation.fd));
         }
 
         if (const auto err = rearmAcceptOperation(acceptOperation); !err) {
