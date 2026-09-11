@@ -6,7 +6,7 @@ module;
 #include <cstdint>
 #include <utility>
 
-module etsl.tcp.acceptor:delegate;
+export module etsl.tcp.acceptor:delegate;
 
 import etsl.net;
 

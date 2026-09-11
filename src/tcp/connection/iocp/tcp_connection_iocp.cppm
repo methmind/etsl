@@ -195,9 +195,15 @@ export namespace etsl
 
         this->fd_ = etl::move(fd);
         this->state_ = tcp_connection_state_e::CONNECTED;
+        auto fallback = [this](int32_t err) -> etl::expected<void, int32_t> {
+            this->fd_.dispose();
+            this->state_ = tcp_connection_state_e::NONE;
+
+            return etl::unexpected(err);
+        };
+
         if (const auto err = createReadProbeOperation(); !err) {
-            beginTeardown(err.error());
-            return err;
+            return fallback(err.error());
         }
 
         return {};

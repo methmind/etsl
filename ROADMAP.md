@@ -70,7 +70,7 @@
 - CMake ≥ 4.2, `CMAKE_CXX_SCAN_FOR_MODULES ON`. Модули перечислены в
   `FILE_SET CXX_MODULES` в `CMakeLists.txt` — **каждый новый модуль добавлять туда**.
 - **Тесты:** GoogleTest v1.17.0 (FetchContent), опция `ETSL_BUILD_TESTS`; набор
-  `test/tcp_connection_iocp_test.cpp` — 41 тест, Windows/IOCP-only (на
+  `test/tcp_connection_iocp_test.cpp` — 44 теста, Windows/IOCP-only (на
   не-Windows сборка suite отключена). Из-за `CMAKE_CROSSCOMPILING` тест
   регистрируется одним `add_test` без `gtest_discover_tests`; прогон —
   скопировать exe на ВМ и запустить. *(07.09.2026: прогон 35/35 PASSED после
@@ -83,9 +83,14 @@
   `windows-clang-mingw.cmake`, каталог `cmake-build-debug-clang-mingw-windows/`
   — прежний каталог `cmake-build-debug-clang-windows/` остался на удалённом
   msvc-тулчейне). 35 тестов наследованы (контракт connection), +5 акцепторных
-  — формальное закрытие фазы №3, см. 2.4. 11.09.2026: 41 тест (+покрытие
+  — формальное закрытие фазы №3, см. 2.4. 11.09.2026 (вечер): **44 теста,
+  44/44 ×3** — +`AcceptorDisposeFromOnIncomingDrainsBacklogAndKeepsSession`,
+  `AcceptorSingleSlotBacklogTeardownThroughLastOperation`,
+  `AcceptorReuseAfterDisposedReinitializesCleanly`. Ранее в тот же день: 41 тест (+покрытие
   адреса пира); после финальной правки акцептора и обновления ожиданий двух
-  акцепторных тестов — **41/41 ×3**, см. 2.4.)*
+  акцепторных тестов — **41/41 ×3**; +тест `dispose()` из `onIncoming` —
+  **42/42 ×3**; +2 теста (пул на 1 слот, реюз после `onDisposed`) —
+  **44/44 ×3**, см. 2.4.)*
 - Тестовый exe на ВМ deploy-хуком **не** обновляется (хук есть только у
   `etsl`) — перед прогоном заливать свежую сборку (команды ниже), иначе
   запускается устаревший бинарь.
@@ -216,7 +221,10 @@ IOCP reactor доставляет raw completion делегату операци
   попадают;
 - `onDisposed(int32_t reason)` — терминальный колбэк; `reason == -1`
   (`EXPLICIT_DISPOSE`) после явного `dispose()`, иначе первая критичная
-  причина (пул опустел).
+  причина (пул опустел). Если пул опустел из-за отказа перевзвода последнего
+  слота, делегат получает сначала `onError(err)` (некритичный отказ слота),
+  затем `onDisposed(err)` (критичное опустение пула) — два разных события,
+  а не дублирование.
 
 Валидный callback одновременно обозначает in-flight operation; reactor очищает
 его перед вызовом, отдельного `pending` flag нет. Виртуальных иерархий и heap
@@ -433,7 +441,7 @@ src/
 │                                     # таймеры реактора (ADR-2)
 └── util/                             # noncopyable.h, etl_chrono.cpp
 
-test/tcp_connection_iocp_test.cpp  # gtest-набор connection + acceptor (41 тест)
+test/tcp_connection_iocp_test.cpp  # gtest-набор connection + acceptor (44 теста)
 review/result.md                   # результаты ревью (не код)
 ```
 
@@ -733,15 +741,35 @@ baseline размера зафиксирован.
       (ожидает 4 × `onError(WSAEINVAL)`, стало 0) и
       `AcceptorInitializeAfterListenFails` (ожидает `WSAEINVAL`, стало
       `WSAEALREADY`): ожидания тестов отражают прежнее поведение, требуют
-      обновления. Открыто по акцептору: двойной отчёт `onError(err)` +
-      `onDisposed(err)` при опустевшем пуле; неинициализированные `local`/
-      `remote` в `GetRemotePeerAddr`; тестов нет на `dispose()` из
-      `onIncoming`, пул на 1 слот, реюз объекта после `onDisposed`;
+      обновления. Открыто по акцептору: ~~двойной отчёт `onError(err)` +
+      `onDisposed(err)`~~ (штатно, §8); ~~неинициализированные `local`/
+      `remote` в `GetRemotePeerAddr`~~ (исправлено 11.09); тестов нет на `dispose()` из
+      `onIncoming`, пул на 1 слот, реюз объекта после `onDisposed` (добавлены 11.09, 44/44);
       D15; вопросы §8. `[x]` — после echo под нагрузкой (2.5).*
       *Обновлено (11.09.2026, там же): оба отмеченных теста поправлены —
       `AcceptorListenTwiceReturnsInvalid` теперь ожидает тихое дренирование
       (`acceptorErrorCount_ == 0`), `AcceptorInitializeAfterListenReturnsAlready`
-      — `WSAEALREADY`. Прогон на ВМ: **41/41 ×3** (Debug, MinGW-тулчейн).*
+      — `WSAEALREADY`. Добавлен `AcceptorDisposeFromOnIncomingDrainsBacklogAndKeepsSession`
+      (закрывает пункт «тестов нет на dispose() из onIncoming»): реентерабельный
+      снос из колбэка поставки — перевзвод слота тихо падает (destroy без
+      `onError`), ошибка `armAcceptBacklog` из хвоста completion не перетирает
+      причину `EXPLICIT_DISPOSE`, принятое до сноса соединение живёт
+      независимо от акцептора (доставка пейлоада после закрытия gateway).
+      Прогон на ВМ: **42/42 ×3** (Debug, MinGW-тулчейн).*
+      *Дополнено (11.09.2026, тем же): закрыты последние два открытых пункта
+      акцепторного покрытия. `AcceptorSingleSlotBacklogTeardownThroughLastOperation`
+      — акцептор с `etl::pool<..., 1>` (отдельный делегат `SingleSlotDelegate`,
+      не зависящий от фикстурного акцептора): ровно одна взведённая операция
+      после `listen()` (`backlog.size() == 1`), accept и перевзвод через тот
+      же единственный элемент, teardown дренирует пул до `size() == 0`,
+      `onDisposed(-1)`, `onError` не вызывается. `AcceptorReuseAfterDisposedReinitializesCleanly`
+      — реентерабельные `initialize()`/`listen()` прямо из `onDisposed` на
+      свежем порту: сами guard'ы служат проверкой чистого NONE (gateway закрыт,
+      пул пуст, кеш причины сброшен — иначе WSAEALREADY/WSAEINVAL); возрождённый
+      акцептор обслуживает полную сессию (accept + пейлоад), финальный снос —
+      вторая пара `onDisposed(EXPLICIT_DISPOSE)` + пустой пул. Прогон на ВМ:
+      **44/44 ×3** (Debug, MinGW-тулчейн). Открытых пунктов в акцепторном
+      gtest-покрытии не осталось.*
 - [ ] **2.5** `examples/echo_client.cpp` + `examples/echo_server.cpp`; гонка
       ≥ 64 МБ без потерь/рассинхрона; зафиксировать размер sample:
       `echo_server: ___ КБ` → установить бюджет.
@@ -863,13 +891,16 @@ baseline размера зафиксирован.
   зарезервирована (ADR-7), не реализуется в v1. Кеши extension-функций
   (`static` в `GetExtensionFunction<GUID>`) не синхронизированы — при
   мультипоточном `run()` пересмотреть.
-- **Хранилище backlog акцептора и epoll (11.09.2026):** конструктор
-  `C_TCPAcceptorIOCP(reactor, etl::ipool& backlog, delegate)` — IOCP-деталь:
-  на epoll операций нет (`EPOLLIN` на листенере + `accept4` в цикле до
-  `EAGAIN`), пул не нужен, пользовательский код разойдётся (против ADR-10).
-  Вариант: параметр шаблона `C_TCPAcceptor<D, N>` — на IOCP встроенный
-  `etl::pool<accept_operation_s, N>` (без кучи, ADR-4), на epoll — лимит
-  `accept4` за пробуждение. Решить до Этапа 4.
+- ~~**Хранилище backlog акцептора и epoll**~~ — *решено 11.09.2026:* пул
+  остаётся внешним — `C_TCPAcceptor(reactor, etl::ipool& backlog, delegate)`.
+  Библиотека не диктует источник памяти: `etl::ipool` покрывает и
+  статический `etl::pool<T, N>`, и `etl::pool_ext`/`generic_pool_ext` над
+  буфером из кучи (ADR-4). **Отвергнуто:** параметр шаблона
+  `C_TCPAcceptor<D, N>` со встроенным пулом — принуждает к памяти внутри
+  объекта. Следствие для Этапа 4: epoll-бекенд обязан принимать ту же
+  сигнатуру конструктора (ADR-10 — код пользователя одинаков); что epoll
+  делает с пулом (игнорирует / берёт `capacity()` как лимит `accept4` за
+  пробуждение) — решить в 4.x.
 - **Ошибки accept на epoll:** по accept(2) сетевые ошибки нового соединения
   (`ECONNABORTED`, `EPROTO`, `ENETDOWN`, `EHOSTUNREACH`…) лечатся повтором как
   `EAGAIN`; `EMFILE`/`ENFILE`/`ENOBUFS` при LT-epoll дают горячий цикл —
@@ -880,6 +911,7 @@ baseline размера зафиксирован.
   `onIncoming(const C_Socket&, …)` — сокет тогда молча закрывается при
   перевзводе. Отрицательное требование (запрет lvalue-вызова) рассмотрено и
   пока не принято.
-- **Один канал отчёта при опустевшем пуле:** сейчас `onError(err)` и затем
-  `onDisposed(err)`; альтернатива — сообщать ошибку перевзвода после
-  `armAcceptBacklog()` и только при `LISTENING`.
+- ~~**Один канал отчёта при опустевшем пуле**~~ — *решено 11.09.2026:*
+  `onError(err)` + затем `onDisposed(err)` — штатно, это два разных события:
+  некритичный отказ перевзвода слота, а следом — критичное опустение пула и
+  снос (см. ADR-3).

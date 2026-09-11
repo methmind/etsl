@@ -160,8 +160,7 @@ export namespace etsl
         const auto getAcceptExSockaddrs = reinterpret_cast<LPFN_GETACCEPTEXSOCKADDRS>(*getResult);
         getAcceptExSockaddrs(acceptBuffer, 0, ACCEPT_BUFFER_SIZE,
             ACCEPT_BUFFER_SIZE, &local, &localSize,
-            &remote, &remoteSize
-        );
+            &remote, &remoteSize);
 
         if (!remote) {
             return etl::unexpected(WSAEINVAL);

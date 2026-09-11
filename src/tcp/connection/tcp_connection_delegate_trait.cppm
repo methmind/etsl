@@ -5,7 +5,7 @@ module;
 #include <concepts>
 #include <cstdint>
 
-module etsl.tcp.connection:delegate;
+export module etsl.tcp.connection:delegate;
 
 import :defs;
 

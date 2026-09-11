@@ -218,6 +218,43 @@ private:
     uint8_t sendBytes_[4]{'2', 'n', 'd', '!'};
 };
 
+// A standalone acceptor with a single-slot backlog pool, driven by its own
+// delegate type so its counters stay independent from the fixture-owned
+// acceptor. Exercises the "last armed operation → teardown" path through
+// exactly one pool element.
+class SingleSlotDelegate
+{
+public:
+    using Acceptor = etsl::C_TCPAcceptor<SingleSlotDelegate>;
+
+    explicit SingleSlotDelegate(TCPConnectionIOCPTest& owner) noexcept
+        : owner_(owner) {}
+
+    SingleSlotDelegate(const SingleSlotDelegate&) = delete;
+    SingleSlotDelegate& operator=(const SingleSlotDelegate&) = delete;
+
+    bool Start(const etsl::C_Address& addr) noexcept;
+    void Dispose() noexcept;
+    void Release() noexcept;
+
+    void onIncoming(etsl::C_Socket fd, const etsl::C_Address& remoteAddr) noexcept;
+    void onError(int32_t error) noexcept;
+    void onDisposed(int32_t reason) noexcept;
+
+    etl::pool<Acceptor::accept_operation_t, 1> backlog{};
+    std::optional<Acceptor> acceptor_;
+    etsl::C_Socket held;
+    int accepted{0};
+    int disposed{0};
+    int errors{0};
+    bool started{false};
+    int32_t lastReason{0};
+    int32_t lastError{0};
+
+private:
+    TCPConnectionIOCPTest& owner_;
+};
+
 // The fixture is the delegate of every side at once: the client connection
 // under test, the acceptor and (through PeerDelegate) the accepted peer
 // connections. Everything runs on one reactor thread; the loop is stopped
@@ -347,6 +384,11 @@ public:
     void NotifyAuxIdle() noexcept
     {
         auxIdle_ = true;
+        TryFinish();
+    }
+
+    void NotifySecondaryDisposed() noexcept
+    {
         TryFinish();
     }
 
@@ -549,8 +591,16 @@ public:
         for (auto& slot : peers_) {
             if (!slot.Used()) {
                 slot.Adopt(std::move(fd));
-                return;
+                break;
             }
+        }
+
+        if (disposeFromOnIncoming_) {
+            // Reentrant teardown from inside the accept delivery. Mark the
+            // dispose as requested so the finish gate does not issue a
+            // second one and waits for this one to complete instead.
+            acceptorDisposeRequested_ = true;
+            acceptor_->dispose();
         }
     }
 
@@ -564,6 +614,26 @@ public:
     {
         acceptorDisposedCount_++;
         acceptorLastReason_ = reason;
+
+        if (reuseAcceptorOnDisposed_ && acceptorDisposedCount_ == 1 && rebornAddress_.has_value()) {
+            // The object is expected back at NONE: rebind on a fresh port and
+            // relaunch listening right from the terminal callback. The guards
+            // inside initialize()/listen() double as the clean-state checks
+            // (gateway closed, backlog drained, state and reason cache reset
+            // — otherwise WSAEALREADY/WSAEINVAL would fire here instead).
+            reuseAcceptorOnDisposed_ = false;
+            rebornInitOk_ = acceptor_->initialize(*rebornAddress_).has_value();
+            rebornListenOk_ = rebornInitOk_ && acceptor_->listen(4).has_value();
+            if (!rebornListenOk_) {
+                TryFinish();
+                return;
+            }
+
+            acceptorDisposeRequested_ = false; // the gate disposes the reborn acceptor later
+            rebornConnectOk_ = driver_->connect(*rebornAddress_).has_value();
+            return;
+        }
+
         TryFinish();
     }
 
@@ -593,6 +663,7 @@ protected:
             slot.Release();
         }
         second_.Release();
+        singleSlot_.Release();
         acceptor_.reset();
         acceptorAddress_.reset();
         secondConnectAddress_ = nullptr;
@@ -666,6 +737,17 @@ protected:
             }
         }
 
+        if (singleSlot_.started) {
+            if (!singleSlotDisposeRequested_) {
+                singleSlotDisposeRequested_ = true;
+                singleSlot_.Dispose();
+                return;
+            }
+            if (singleSlot_.disposed == 0) {
+                return;
+            }
+        }
+
         // Stop through a zero-delay timer instead of shutting down in place:
         // RequestFinish() may run before reactor.run() even starts, and a
         // direct shutdown() would skip the loop pass that drains the pending
@@ -710,8 +792,10 @@ protected:
     etl::pool<Acceptor::accept_operation_t, 4> backlog_{};
     std::optional<Acceptor> acceptor_;
     std::optional<C_Address> acceptorAddress_;
+    std::optional<C_Address> rebornAddress_;
     uint16_t acceptorPort_{0};
     SecondClientDelegate second_{*this};
+    SingleSlotDelegate singleSlot_{*this};
     std::array<PeerDelegate, 4> peers_;
 
     const C_Address* secondConnectAddress_{nullptr};
@@ -775,6 +859,12 @@ protected:
     bool auxIdle_{false};
     bool acceptorStarted_{false};
     bool acceptorDisposeRequested_{false};
+    bool disposeFromOnIncoming_{false};
+    bool singleSlotDisposeRequested_{false};
+    bool reuseAcceptorOnDisposed_{false};
+    bool rebornInitOk_{false};
+    bool rebornListenOk_{false};
+    bool rebornConnectOk_{false};
 
     friend class PeerDelegate;
     friend class SecondClientDelegate;
@@ -980,6 +1070,57 @@ void SecondClientDelegate::onDisposed() noexcept
 {
     disposedCount_++;
     owner_.NotifyAuxIdle();
+}
+
+// ---- SingleSlotDelegate ------------------------------------------------------
+
+bool SingleSlotDelegate::Start(const etsl::C_Address& addr) noexcept
+{
+    acceptor_.emplace(owner_.reactor(), backlog, *this);
+    if (!acceptor_->initialize(addr).has_value()) {
+        return false;
+    }
+
+    if (!acceptor_->listen(4).has_value()) {
+        return false;
+    }
+
+    started = true;
+    return true;
+}
+
+void SingleSlotDelegate::Dispose() noexcept
+{
+    if (acceptor_.has_value()) {
+        acceptor_->dispose();
+    }
+}
+
+void SingleSlotDelegate::Release() noexcept
+{
+    held.dispose();
+    acceptor_.reset();
+}
+
+void SingleSlotDelegate::onIncoming(etsl::C_Socket fd, const etsl::C_Address& /*remoteAddr*/) noexcept
+{
+    accepted++;
+    // Keep the accepted session open as a raw socket; the pool slot rearms
+    // itself in the completion tail either way.
+    held = std::move(fd);
+}
+
+void SingleSlotDelegate::onError(const int32_t error) noexcept
+{
+    errors++;
+    lastError = error;
+}
+
+void SingleSlotDelegate::onDisposed(const int32_t reason) noexcept
+{
+    disposed++;
+    lastReason = reason;
+    owner_.NotifySecondaryDisposed();
 }
 
 // ---- connection: dispose contract --------------------------------------------
@@ -1940,6 +2081,145 @@ TEST_F(TCPConnectionIOCPTest, AcceptorInitializeWithForeignBacklogFails)
     EXPECT_EQ(acceptorDisposedCount_, 1);
     EXPECT_EQ(acceptorLastReason_, -1);
     EXPECT_EQ(acceptorErrorCount_, 0);
+}
+
+// Reentrant dispose from inside the accept delivery. The completion tail runs
+// after the delegate has returned (state already DISPOSING): the slot rearm
+// must fail silently, the armAcceptBacklog failure must not overwrite the
+// EXPLICIT_DISPOSE reason, and the accepted connection — handed out just
+// before the teardown — must stay fully operational on its own.
+TEST_F(TCPConnectionIOCPTest, AcceptorDisposeFromOnIncomingDrainsBacklogAndKeepsSession)
+{
+    ASSERT_TRUE(StartAcceptor());
+
+    static constexpr char kPayload[] = "ping";
+    static constexpr int kPayloadLen = static_cast<int>(sizeof(kPayload) - 1);
+
+    static constexpr uint8_t kBytes[] = "ping";
+    peer(0).cfg.sendOnAdopt = kBytes;
+    peer(0).cfg.sendOnAdoptLen = sizeof(kBytes) - 1;
+    captureReadyReadPayload_ = true;
+    disposeOnReadyRead_ = true;
+    disposeFromOnIncoming_ = true;
+
+    ASSERT_TRUE(driver_->connect(AcceptorAddress()).has_value());
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    // The accept delivery is deterministic here: the client holds the session
+    // open until the payload arrives, long past the accept completion.
+    EXPECT_EQ(acceptedCount_, 1);
+    EXPECT_TRUE(peer(0).sendOk);
+    ASSERT_GE(readyReadCount_, 1);
+    ASSERT_EQ(capturedPayloadLen_, kPayloadLen);
+    EXPECT_EQ(std::memcmp(capturedPayload_, kPayload, static_cast<size_t>(kPayloadLen)), 0);
+    EXPECT_EQ(disposedCount_, 1);
+
+    // Acceptor teardown contract: exactly one terminal onDisposed, the
+    // EXPLICIT_DISPOSE reason preserved, aborted backlog slots (this one plus
+    // the three still-pending) never reported to onError.
+    EXPECT_EQ(acceptorDisposedCount_, 1);
+    EXPECT_EQ(acceptorLastReason_, -1);
+    EXPECT_EQ(acceptorErrorCount_, 0);
+
+    // The accepted session outlived the acceptor and ended cleanly.
+    EXPECT_TRUE(peer(0).IsIdle());
+}
+
+// A single-slot backlog pool: listen arms exactly one AcceptEx, the accept
+// cycles through that single element (rearm after delivery), and the teardown
+// drains the pool through the same lone operation — backlog empty at the
+// terminal onDisposed, no errors reported.
+TEST_F(TCPConnectionIOCPTest, AcceptorSingleSlotBacklogTeardownThroughLastOperation)
+{
+    uint16_t port = 0;
+    ASSERT_TRUE(ReservePort(port));
+
+    C_Address addr;
+    ASSERT_TRUE(MakeAddress(port, addr));
+
+    ASSERT_TRUE(singleSlot_.Start(addr));
+    ASSERT_EQ(singleSlot_.backlog.size(), static_cast<size_t>(1));
+
+    // Hold the client session past the accept delivery (timer dispose), so
+    // the single slot deterministically accepts and rearms.
+    scheduleDisposeOnConnectMs_ = 30;
+
+    ASSERT_TRUE(driver_->connect(addr).has_value());
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    ASSERT_EQ(connectCount_, 1);
+    EXPECT_EQ(lastConnectError_, 0);
+    EXPECT_EQ(disposedCount_, 1);
+
+    // One accept through the single element; the rearmed operation was the
+    // last one standing when the teardown began.
+    EXPECT_EQ(singleSlot_.accepted, 1);
+    EXPECT_TRUE(singleSlot_.held.is_valid());
+    EXPECT_EQ(singleSlot_.disposed, 1);
+    EXPECT_EQ(singleSlot_.lastReason, -1);
+    EXPECT_EQ(singleSlot_.errors, 0);
+    EXPECT_EQ(singleSlot_.backlog.size(), static_cast<size_t>(0));
+}
+
+// Object rebirth after the terminal onDisposed: initialize()/listen() called
+// reentrantly from the callback must succeed — their guards double as the
+// clean-state checks (state NONE, gateway closed, backlog drained, reason
+// cache reset) — and the reborn acceptor must serve a full session.
+TEST_F(TCPConnectionIOCPTest, AcceptorReuseAfterDisposedReinitializesCleanly)
+{
+    uint16_t port1 = 0;
+    uint16_t port2 = 0;
+    ASSERT_TRUE(ReservePort(port1));
+    ASSERT_TRUE(ReservePort(port2));
+
+    acceptorAddress_.emplace();
+    ASSERT_TRUE(acceptorAddress_->initialize("127.0.0.1", port1).has_value());
+    rebornAddress_.emplace();
+    ASSERT_TRUE(rebornAddress_->initialize("127.0.0.1", port2).has_value());
+
+    EmplaceAcceptor();
+    ASSERT_TRUE(acceptor_->initialize(*acceptorAddress_).has_value());
+    ASSERT_TRUE(acceptor_->listen(4).has_value());
+    acceptorStarted_ = true;
+
+    reuseAcceptorOnDisposed_ = true;
+
+    // Session on the reborn acceptor: deterministic accept — the peer feeds
+    // data and the client holds the session until the payload arrives.
+    static constexpr char kPayload[] = "ping";
+    static constexpr int kPayloadLen = static_cast<int>(sizeof(kPayload) - 1);
+
+    static constexpr uint8_t kBytes[] = "ping";
+    peer(0).cfg.sendOnAdopt = kBytes;
+    peer(0).cfg.sendOnAdoptLen = sizeof(kBytes) - 1;
+    captureReadyReadPayload_ = true;
+    disposeOnReadyRead_ = true;
+
+    // Lifecycle 1 ends before any client connects.
+    acceptor_->dispose();
+    RequestFinish();
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    // Reentrant rebirth from onDisposed succeeded and served a full session.
+    EXPECT_TRUE(rebornInitOk_);
+    EXPECT_TRUE(rebornListenOk_);
+    EXPECT_TRUE(rebornConnectOk_);
+    ASSERT_EQ(acceptorDisposedCount_, 2);
+    EXPECT_EQ(acceptedCount_, 1);
+    ASSERT_GE(readyReadCount_, 1);
+    ASSERT_EQ(capturedPayloadLen_, kPayloadLen);
+    EXPECT_EQ(std::memcmp(capturedPayload_, kPayload, static_cast<size_t>(kPayloadLen)), 0);
+    ASSERT_EQ(connectCount_, 1);
+    EXPECT_EQ(lastConnectError_, 0);
+    EXPECT_EQ(disposedCount_, 1);
+    // Both lifecycles ended with a fresh EXPLICIT_DISPOSE reason; the fixture
+    // pool drained completely after the final teardown.
+    EXPECT_EQ(acceptorLastReason_, -1);
+    EXPECT_EQ(acceptorErrorCount_, 0);
+    EXPECT_EQ(backlog_.size(), static_cast<size_t>(0));
 }
 
 } // namespace
