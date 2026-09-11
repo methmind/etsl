@@ -26,7 +26,11 @@ export namespace etsl
     public:
         using accept_operation_t = accept_operation_s;
 
-        ~C_TCPAcceptorIOCP() noexcept { assert(this->backlog_.empty() && "UAF error caught!"); }
+        ~C_TCPAcceptorIOCP() noexcept
+        {
+            assert(!this->disposeOperation_.is_linked() && "UAF error caught!");
+            assert(this->backlog_.empty() && "UAF error caught!");
+        }
 
         explicit C_TCPAcceptorIOCP(C_Reactor& reactor, etl::ipool& backlog, delegate_t& delegate) noexcept;
 
@@ -39,6 +43,8 @@ export namespace etsl
         [[nodiscard]] etl::expected<void, int32_t> listen(int32_t backlog) noexcept;
 
     private:
+        [[nodiscard]] static etl::expected<C_Address, int32_t> GetRemotePeerAddr(socket_t fd, void* acceptBuffer) noexcept;
+
         [[nodiscard]] static etl::expected<void, int32_t> AcceptEx(socket_t gateway,
             accept_operation_t& operation) noexcept;
 
@@ -48,7 +54,7 @@ export namespace etsl
 
         void beginTeardown(int32_t reason) noexcept;
 
-        void acceptIncoming(C_Socket&& fd) noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> acceptIncoming(accept_operation_t& operation, int32_t lastError) noexcept;
 
         void onIncoming(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept;
 
@@ -80,16 +86,16 @@ export namespace etsl
     template<typename delegate_t>
     etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::initialize(const C_Address& addr) noexcept
     {
-        if (!this->backlog_.capacity()) {
-            return etl::unexpected(static_cast<int32_t>(ERROR_NOT_ENOUGH_MEMORY));
-        }
-
-        if (this->backlog_.max_item_size() != sizeof(accept_operation_t)) {
-            return etl::unexpected(static_cast<int32_t>(MEM_E_INVALID_SIZE));
-        }
-
-        if (this->state_ != tcp_acceptor_state_e::NONE) {
+        if (this->state_ != tcp_acceptor_state_e::NONE || this->gateway_.is_valid()) {
             return etl::unexpected(WSAEALREADY);
+        }
+
+        if (!this->backlog_.capacity()) {
+            return etl::unexpected(WSAENOBUFS);
+        }
+
+        if (this->backlog_.max_item_size() != sizeof(accept_operation_t) || !this->backlog_.empty()) {
+            return etl::unexpected(WSAEINVAL);
         }
 
         auto gate = CreateSocket();
@@ -111,7 +117,7 @@ export namespace etsl
             return etl::unexpected(err.error());
         }
 
-        this->gateway_ = std::move(*gate);
+        this->gateway_ = etl::move(*gate);
         return {};
     }
 
@@ -125,16 +131,8 @@ export namespace etsl
         auto fallback = [this](int32_t err) -> etl::expected<void, int32_t> {
             this->state_ = tcp_acceptor_state_e::NONE;
             this->gateway_.dispose();
-            if (this->backlog_.empty()) {
-                /* @note
-                 * Ни одна AcceptEx не взведена - акцептор не начал работу. Отдаём код ошибки
-                 * Терминального колбэка не будет.
-                */
-                return etl::unexpected(err);
-            }
 
-            beginTeardown(err);
-            return {};
+            return etl::unexpected(err);
         };
 
         if (::listen(this->gateway_.get(), backlog) == SOCKET_ERROR) {
@@ -150,10 +148,37 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::AcceptEx(socket_t gateway,
-        accept_operation_t& operation) noexcept
+    etl::expected<C_Address, int32_t> C_TCPAcceptorIOCP<delegate_t>::GetRemotePeerAddr(socket_t fd, void* acceptBuffer) noexcept {
+        auto getResult = GetExtensionFunction<WSAID_GETACCEPTEXSOCKADDRS>(fd);
+        if (!getResult) {
+            return etl::unexpected(getResult.error());
+        }
+
+        os_sockaddr* local{};
+        os_sockaddr* remote{};
+        uint32_t localSize, remoteSize;
+        const auto getAcceptExSockaddrs = reinterpret_cast<LPFN_GETACCEPTEXSOCKADDRS>(*getResult);
+        getAcceptExSockaddrs(acceptBuffer, 0, ACCEPT_BUFFER_SIZE,
+            ACCEPT_BUFFER_SIZE, &local, reinterpret_cast<LPINT>(&localSize),
+            &remote, reinterpret_cast<LPINT>(&remoteSize)
+        );
+
+        if (!remote) {
+            return etl::unexpected(WSAEINVAL);
+        }
+
+        C_Address addr;
+        if (!addr.initialize(*remote, remoteSize)) {
+            return etl::unexpected(WSAEINVAL);
+        }
+
+        return addr;
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::AcceptEx(socket_t gateway, accept_operation_t& operation) noexcept
     {
-        static auto getResult{GetExtensionFunction(gateway, WSAID_ACCEPTEX)};
+        auto getResult = GetExtensionFunction<WSAID_ACCEPTEX>(gateway);
         if (!getResult) {
             return etl::unexpected(getResult.error());
         }
@@ -174,7 +199,7 @@ export namespace etsl
     etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::rearmAcceptOperation(accept_operation_t& operation) noexcept
     {
         if (this->state_ != tcp_acceptor_state_e::LISTENING) {
-            return etl::unexpected(WSAEINVAL);
+            return etl::unexpected(static_cast<int32_t>(WSA_OPERATION_ABORTED));
         }
 
         auto newDescriptor = CreateSocket();
@@ -183,12 +208,12 @@ export namespace etsl
         }
 
         C_Reactor::FlushOperation(operation);
-        operation.fd = std::move(*newDescriptor);
+        operation.fd = etl::move(*newDescriptor);
         operation.callback = decltype(accept_operation_t::callback)::create<
            C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this);
 
         if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
-            return etl::unexpected(err.error());
+            return err;
         }
 
         return {};
@@ -197,21 +222,30 @@ export namespace etsl
     template<typename delegate_t>
     etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::armAcceptBacklog() noexcept
     {
-        while (this->backlog_.size() < this->backlog_.capacity()) {
-            auto destructor = [backlog = &backlog_](auto ptr) -> void {
-                backlog->destroy<accept_operation_t>(ptr);
-            };
+        if (this->state_ != tcp_acceptor_state_e::LISTENING) {
+            return etl::unexpected(static_cast<int32_t>(WSA_OPERATION_ABORTED));
+        }
 
+        etl::expected<void, int32_t> lastError;
+        auto destructor = [backlog = &backlog_](auto ptr) -> void {
+            backlog->destroy<accept_operation_t>(ptr);
+        };
+
+        for (auto i = this->backlog_.size(); i < this->backlog_.capacity(); ++i) {
             auto operation = etl::unique_ptr<accept_operation_t, decltype(destructor)>(this->backlog_.create<accept_operation_t>(), destructor);
-            /*if (!operation) { Impossible???
-                return etl::unexpected(static_cast<int32_t>(ERROR_NOT_ENOUGH_MEMORY));
-            }*/
+            if (!operation) {
+                continue;
+            }
 
-            if (const auto err = rearmAcceptOperation(*operation); !err) {
-                return etl::unexpected(err.error());
+            if (lastError = rearmAcceptOperation(*operation); !lastError) {
+                continue;
             }
 
             operation.release();
+        }
+
+        if (this->backlog_.empty()) {
+            return lastError;
         }
 
         return {};
@@ -241,37 +275,46 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    void C_TCPAcceptorIOCP<delegate_t>::acceptIncoming(C_Socket&& fd) noexcept
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::acceptIncoming(accept_operation_t& operation, int32_t lastError) noexcept
     {
-        socket_t listening = this->gateway_.get();
-        if (setsockopt(fd.get(), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, reinterpret_cast<char*>(&listening), sizeof(listening)) == SOCKET_ERROR) {
-            return;
+        if (this->state_ != tcp_acceptor_state_e::LISTENING) {
+            return etl::unexpected(static_cast<int32_t>(WSA_OPERATION_ABORTED));
         }
 
-        this->delegate_.onIncoming(std::move(fd));
+        if (lastError != ERROR_SUCCESS) {
+            return etl::unexpected(C_Reactor::TranslateError(this->gateway_, operation, lastError));
+        }
+
+        socket_t listening = this->gateway_.get();
+        if (setsockopt(operation.fd.get(), SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT, reinterpret_cast<char*>(&listening), sizeof(listening)) == SOCKET_ERROR) {
+            return etl::unexpected(WSAGetLastError());
+        }
+
+        auto addrResult = GetRemotePeerAddr(listening, operation.buffer);
+        if (!addrResult) {
+            return etl::unexpected(addrResult.error());
+        }
+
+        this->delegate_.onIncoming(etl::move(operation.fd), *addrResult);
+        return {};
     }
 
     template<typename delegate_t>
     void C_TCPAcceptorIOCP<delegate_t>::onIncoming(C_Reactor::operation_t& operation,
         uint32_t /*transferred*/, int32_t error) noexcept
     {
-        auto& acceptOperation = reinterpret_cast<accept_operation_t&>(operation);
-        auto fallback = [this](int32_t err, const accept_operation_t& op) -> void {
-            this->backlog_.destroy<accept_operation_t>(&op);
-            beginTeardown(err);
-        };
-
-        if (this->state_ == tcp_acceptor_state_e::DISPOSING) {
-            fallback(C_Reactor::TranslateError(acceptOperation.fd, operation, error), acceptOperation);
-            return;
-        }
-
-        if (error == ERROR_SUCCESS) {
-            acceptIncoming(std::move(acceptOperation.fd));
+        auto& acceptOperation = static_cast<accept_operation_t&>(operation);
+        if (const auto err = acceptIncoming(acceptOperation, error); !err && err.error() != WSA_OPERATION_ABORTED) {
+            this->delegate_.onError(err.error());
         }
 
         if (const auto err = rearmAcceptOperation(acceptOperation); !err) {
-            fallback(err.error(), acceptOperation);
+            this->backlog_.destroy<accept_operation_t>(&acceptOperation);
+            (err.error() != WSA_OPERATION_ABORTED) ? this->delegate_.onError(err.error()) : void();
+        }
+
+        if (const auto err = armAcceptBacklog(); !err) {
+            beginTeardown(err.error());
         }
     }
 

@@ -39,18 +39,26 @@
 
 ---
 
-## 2. Окружение и сборка (обновлено 07.09.2026)
+## 2. Окружение и сборка (обновлено 11.09.2026)
 
-- Основной режим — **кросс-компиляция из Linux под Windows**: toolchain
-  `~/Документы/toolchain/windows-clang.cmake` (clang, target
-  `x86_64-pc-windows-msvc`, Windows SDK в `~/winsdk`), каталог сборки
-  `cmake-build-debug-clang-windows/` (Ninja). Пресеты `clang-debug`/
-  `clang-minsize` из `CMakePresets.json` рассчитаны на MSYS2-окружение и
-  в Linux-кросс-сборке не используются.
+- Основной режим — **кросс-компиляция из Linux под Windows** через
+  **MinGW-тулчейн** `~/Документы/toolchain/windows-clang-mingw.cmake` (clang,
+  target `x86_64-w64-mingw32`, sysroot `/usr/x86_64-w64-mingw32/sys-root/mingw`),
+  каталог сборки `cmake-build-debug-clang-mingw-windows/` (Ninja, Debug; таргеты
+  `etsl_core`, `etsl`, `tcp_connection_iocp_test`). Прежний MSVC-target тулчейн
+  (`windows-clang.cmake`, target `x86_64-pc-windows-msvc`, SDK в `~/winsdk`) на
+  машине **отсутствует** (проверено 11.09.2026): каталоги
+  `cmake-build-debug-clang-windows/` и `cmake-build-minsize-clang-windows/`
+  сконфигурированы под него и не реконфигурируются — **MinSizeRel-сборки и
+  `size-report` сейчас нет**, пока не заведён MinSizeRel-каталог на MinGW
+  (замеры ADR-9 сделаны на MSVC-target и с MinGW напрямую не сравнимы).
+  Пресеты `clang-debug`/`clang-minsize` из `CMakePresets.json` рассчитаны на
+  MSYS2-окружение и в Linux-кросс-сборке не используются.
 - Запуск и отладка — Windows-ВМ `win-dev` (192.168.122.51, ключ
-  `~/.ssh/win-dev`); POST_BUILD-хук таргета `etsl` деплоит exe по SSH/scp.
-  Известный дефект сборки: хук ссылается на ключ `~/.ssh/wsa-dev`, которого
-  нет, — деплой падает до ручной правки пути.
+  `~/.ssh/win-dev`, пользователь `sexey`, каталог `C:/dev/`); POST_BUILD-хук
+  таргета `etsl` деплоит exe по SSH/scp (D9 закрыт). Если ВМ не отвечает,
+  `ninja … etsl` падает **после** успешной линковки — для проверки сборки
+  собирать `etsl_core` и тест отдельно.
 - MSVC (`cl`) **не поддерживается** и не планируется; проект ориентирован
   исключительно на Clang.
 - ETL 20.48.1 (`external/etl`, submodule; обновлён с 20.47.1 и застейджен
@@ -62,20 +70,42 @@
 - CMake ≥ 4.2, `CMAKE_CXX_SCAN_FOR_MODULES ON`. Модули перечислены в
   `FILE_SET CXX_MODULES` в `CMakeLists.txt` — **каждый новый модуль добавлять туда**.
 - **Тесты:** GoogleTest v1.17.0 (FetchContent), опция `ETSL_BUILD_TESTS`; набор
-  `test/tcp_connection_iocp_test.cpp` — 35 тестов, Windows/IOCP-only (на
+  `test/tcp_connection_iocp_test.cpp` — 41 тест, Windows/IOCP-only (на
   не-Windows сборка suite отключена). Из-за `CMAKE_CROSSCOMPILING` тест
   регистрируется одним `add_test` без `gtest_discover_tests`; прогон —
   скопировать exe на ВМ и запустить. *(07.09.2026: прогон 35/35 PASSED после
   закрытия D10; рост с 30 тестов — покрытие adopt, empty-span send,
-  read-WOULDBLOCK.)*
+  read-WOULDBLOCK. 10.09.2026: набор переписан на связку C_TCPAcceptor +
+  C_TCPConnection — loopback «библиотека против библиотеки» на одном реакторе,
+  однопоточно: слушающая сторона — акцептор, принятые сокеты раздаются
+  peer-соединениям через `adopt()`; самодельный blocking-LocalListener и
+  фоновые потоки удалены. 40/40 PASSED (3 прогона подряд, Debug, MinGW-тулчейн
+  `windows-clang-mingw.cmake`, каталог `cmake-build-debug-clang-mingw-windows/`
+  — прежний каталог `cmake-build-debug-clang-windows/` остался на удалённом
+  msvc-тулчейне). 35 тестов наследованы (контракт connection), +5 акцепторных
+  — формальное закрытие фазы №3, см. 2.4. 11.09.2026: 41 тест (+покрытие
+  адреса пира); после финальной правки акцептора и обновления ожиданий двух
+  акцепторных тестов — **41/41 ×3**, см. 2.4.)*
+- Тестовый exe на ВМ deploy-хуком **не** обновляется (хук есть только у
+  `etsl`) — перед прогоном заливать свежую сборку (команды ниже), иначе
+  запускается устаревший бинарь.
+- Результаты ревью кода — `review/result.md` (ревью акцептора 11.09.2026:
+  находки, прогоны, статусы).
 
 Команды:
 
 ```bash
-ninja -C cmake-build-debug-clang-windows tcp_connection_iocp_test  # тесты
-ninja -C cmake-build-debug-clang-windows etsl                          # exe + deploy-хук
-ninja -C cmake-build-minsize-clang-windows etsl size-report            # замер ADR-9
+B=cmake-build-debug-clang-mingw-windows
+ninja -C $B tcp_connection_iocp_test                      # тесты
+ninja -C $B etsl_core CMakeFiles/etsl.dir/main.cpp.obj    # сборка без deploy-хука
+ninja -C $B etsl                                          # exe + deploy-хук
+# прогон на ВМ:
+scp -i ~/.ssh/win-dev $B/test/tcp_connection_iocp_test.exe sexey@192.168.122.51:C:/dev/
+ssh -i ~/.ssh/win-dev sexey@192.168.122.51 "C:\dev\tcp_connection_iocp_test.exe --gtest_brief=1"
 ```
+
+Грабли: после отката исходника через `cp -p` mtime старый — ninja не
+пересобирает; делать `touch`.
 
 ---
 
@@ -171,6 +201,23 @@ IOCP reactor доставляет raw completion делегату операци
   (EOF/RST; error == 0 при graceful);
 - `onDisposed()` — teardown завершён после явного `dispose()`.
 
+Акцептор (`C_TCPAcceptorIOCP<T>`, концепт `TCPAcceptorDelegate`, 11.09.2026):
+
+- `onIncoming(C_Socket fd, const C_Address& remoteAddr)` — принятый сокет
+  (передача владения, вызов `onIncoming(std::move(fd), …)`) и адрес пира,
+  разобранный `GetAcceptExSockaddrs` и скопированный в `C_Address` до перевзвода
+  (буфер операции переиспользуется). Контракт — **только адрес пира**: его
+  нативно отдаёт и `accept4` на epoll; локальный адрес там стоит `getsockname`;
+- `onError(int32_t error)` — некритичная ошибка, акцептор продолжает работу:
+  отказ completion одного соединения (напр. RST до accept; код через
+  `TranslateError`), отказ `SO_UPDATE_ACCEPT_CONTEXT`/разбора адреса, отказ
+  перевзвода слота. Решение о сносе при устойчивых ошибках — за делегатом
+  (`dispose()` из колбэка допустим). Отмены при `dispose()` в `onError` **не**
+  попадают;
+- `onDisposed(int32_t reason)` — терминальный колбэк; `reason == -1`
+  (`EXPLICIT_DISPOSE`) после явного `dispose()`, иначе первая критичная
+  причина (пул опустел).
+
 Валидный callback одновременно обозначает in-flight operation; reactor очищает
 его перед вызовом, отдельного `pending` flag нет. Виртуальных иерархий и heap
 type-erasure нет.
@@ -204,6 +251,19 @@ send-операция всё равно получает терминальны�
 — пользователь может освободить контекст. `CancelIoEx` и подмена callback на
 cancellation-хэндлеры не используются. Уничтожение объекта раньше терминального
 колбэка запрещено (assert на `pendingOps_` в деструкторе).
+
+Акцептор (11.09.2026) — тот же паттерн: роль `pendingOps_` играет
+`backlog_.size()` (пул `accept_operation_t`). Каждый completion сначала
+**освобождает слот**, потом решает: успешный перевзвод — операция
+переиспользуется (без `destroy`/`create`); отказ перевзвода — `destroy`;
+затем единый хвост `armAcceptBacklog()` (восполняет свободные слоты; вне
+`LISTENING` gateway нет — возвращает `WSA_OPERATION_ABORTED`) → при ошибке
+`beginTeardown`. `beginTeardown` вызывается на каждом отменённом completion —
+это штатно: проверка «операций не осталось → `detach`» живёт только внутри
+него, повторы безопасны (кеш причины, `is_linked()`). Код
+`WSA_OPERATION_ABORTED` внутри акцептора означает «не `LISTENING`» и
+отфильтровывается перед `onError`. Порядок «освободить → решить» обязателен:
+проверка пустоты пула до `destroy` теряет `onDisposed` (D12).
 
 ### ADR-6. Ошибки
 
@@ -328,7 +388,7 @@ umbrella слой не заслуживает (`etsl.net:socket`/`etsl.net:facto
 
 ---
 
-## 4. Структура модулей (фактическая после 2.7, обновлено 28.08.2026)
+## 4. Структура модулей (фактическая после 2.7, обновлено 11.09.2026)
 
 ```
 src/
@@ -343,7 +403,8 @@ src/
 │   │                                 # :address :socket :factory
 │   ├── net_defs.cppm                 # socket_t, INVALID_SOCKET, sockaddr-алиасы
 │   ├── net_ops.cppm                  # декларации ParseIPV4, CloseSocket,
-│   │                                 # Shutdown, GetExtensionFunction
+│   │                                 # Shutdown, SetNonBlocking; шаблон
+│   │                                 # GetExtensionFunction<GUID> (кеш на GUID)
 │   ├── net_address.cppm/.cpp         # C_Address
 │   ├── net_socket.cppm               # etsl.net:socket — C_Socket (RAII)
 │   ├── net_socket_factory.cppm       # etsl.net:factory — декларация CreateSocket
@@ -357,8 +418,10 @@ src/
 │   │   └── iocp/                     # C_TCPConnectionIOCP + defs_iocp
 │   └── acceptor/
 │       ├── tcp_acceptor.cppm                   # etsl.tcp.acceptor — alias C_TCPAcceptor
-│       ├── tcp_acceptor_def.cppm               # accept_operation_t
-│       └── iocp/                     # C_TCPAcceptorIOCP
+│       ├── tcp_acceptor_defs.cppm              # :defs — пока пуст
+│       ├── tcp_acceptor_delegate_trait.cppm    # concept TCPAcceptorDelegate
+│       └── iocp/                     # C_TCPAcceptorIOCP + :defs_iocp
+│                                     # (accept_operation_s, состояния, буфер AcceptEx)
 ├── reactor/
 │   ├── reactor.cppm                  # etsl.reactor — alias C_Reactor
 │   ├── reactor_trait.cppm            # concept ReactorTrait: initialize/run/
@@ -370,7 +433,8 @@ src/
 │                                     # таймеры реактора (ADR-2)
 └── util/                             # noncopyable.h, etl_chrono.cpp
 
-test/tcp_connection_iocp_test.cpp  # gtest-набор соединения (30 тестов)
+test/tcp_connection_iocp_test.cpp  # gtest-набор connection + acceptor (41 тест)
+review/result.md                   # результаты ревью (не код)
 ```
 
 Соглашения: имя файла модуля == имя модуля; `export module <domain>[.<sub>]`;
@@ -379,7 +443,10 @@ namespace `etsl`; классы с префиксом `C_`, методы `snake_c
 «контракт + impl-юнит»: `.cppm` — только декларации (ноль ifdef в телах), тела —
 в `<feature>/<os>/*.cpp` (`module <mod>;`), файл выбирает CMake по платформе
 (`if(WIN32)`-блок); umbrella `#ifdef → export import :iocp` — только для модулей,
-экспортирующих типы (tcp, reactor). Запланированные
+экспортирующих типы (tcp, reactor). Исключение (11.09.2026): шаблоны обязаны
+жить в интерфейсе — `GetExtensionFunction<GUID>` (тело в `net_ops.cppm`,
+нешаблонная часть `GetExtensionFunctionImpl` — в `net/win/`, не экспортируется).
+Запланированные
 ранее `core/error.cppm`, `socket/socket_address`, `socket/tcp_socket`,
 `socket/tcp_write_request` не появились: их роли заняли `net:*`,
 делегатный контракт соединения и `send_operation_t` (ADR-2/ADR-3).
@@ -391,9 +458,10 @@ namespace `etsl`; классы с префиксом `C_`, методы `snake_c
 
 ---
 
-## 5. Известные дефекты (обновлено 07.09.2026)
+## 5. Известные дефекты (обновлено 11.09.2026)
 
 D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оставлены как история.
+Подробности D12–D15 — `review/result.md`.
 
 - **D9** *(закрыт 25.08.2026)*: deploy-хук уже использует ключ `~/.ssh/win-dev`
   — деплой Debug- и MinSizeRel-сборок на ВМ `win-dev` прошёл успешно.
@@ -412,15 +480,41 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   Прогон после фикса и рефакторинга контракта соединения: **35/35 PASSED**
   (07.09.2026).
 
-- **D11** *(открыт, найден 07.09.2026)*: акцептор не ставит
-  `SO_UPDATE_ACCEPT_CONTEXT` на принятый сокет — запись 2.4 от 28.08
-  утверждает обратное, код ей не соответствует. Острота со стороны connection
-  снята (07.09.2026): `adopt()` больше не применяет
-  `SO_UPDATE_CONNECT_CONTEXT` (опция осталась только на пути `ConnectEx` —
-  `applyConnection`), невалидная для AcceptEx-сокета опция не ставится.
-  Перенос обновления контекста принятых сокетов на сторону акцептора (нужен
-  дескриптор листенера — есть только у акцептора) — вопрос дизайна акцептора,
-  за владельцем.
+- **D11** *(закрыт 11.09.2026)*: акцептор не ставил
+  `SO_UPDATE_ACCEPT_CONTEXT` на принятый сокет. Теперь опция ставится в
+  `C_TCPAcceptorIOCP::acceptIncoming` с дескриптором листенера до передачи
+  сокета делегату; отказ — `onError`, соединение сбрасывается. На стороне
+  connection `adopt()` опций контекста не ставит (с 07.09.2026).
+
+- **D12** *(закрыт 11.09.2026, найден ревью)*: регрессия teardown акцептора —
+  лямбда `fallback` в `onIncoming` проверяла `backlog_.empty()` **до**
+  `destroy()` операции; после `dispose()` с взведёнными `AcceptEx` последняя
+  отменённая операция не запускала `beginTeardown` → `onDisposed` не приходил
+  никогда. Прогон: 10/40 (все тесты с акцептором — таймаут). Фикс — порядок
+  «освободить → решить» (ADR-5); затем `onIncoming` переписан целиком.
+
+- **D13** *(закрыт 11.09.2026, найден ревью)*: `GetExtensionFunction` с
+  одним `static void* fn` на все GUID — первый запрошенный указатель
+  (`AcceptEx`) возвращался и на `WSAID_CONNECTEX` → `connect()` падал, gtest
+  аварийно завершался на 3-м тесте. Фикс — `template<GUID guid>` (кеш на
+  специализацию, ошибка не кешируется); прогон 40/40 ×3.
+
+- **D14** *(обойдён, 11.09.2026)*: дефект ETL 20.48.1 — const-перегрузка
+  `etl::expected<T,E>::operator*()` (`external/etl/include/etl/expected.h:749`)
+  при отсутствии значения делает `return ETL_NULLPTR` через `const T&`; для
+  `T = void*` — ссылка на временный объект (`-Wreturn-stack-address`), для
+  прочих `T` перегрузка не инстанцируема. Обход: не разыменовывать
+  `const expected` через `*` — брать `.value()` (у `value() const&` такой ветки
+  нет) или не объявлять результат `const`. Кандидат в апстрим.
+
+- **D15** *(открыт, 11.09.2026)*: модульная структура tcp-фич (и connection, и
+  acceptor): `:delegate` — implementation-партиция, импортируемая в
+  интерфейсную `:iocp` (clang:
+  `-Wimport-implementation-partition-unit-in-interface-unit` на
+  `tcp_acceptor_iocp.cppm:18`); интерфейсные партиции `:iocp`/`:defs_iocp`
+  primary interface не реэкспортирует (`import :iocp;` без `export`) — по
+  [module.unit]/3 ill-formed, NDR. Clang пока собирает; чинить в обоих модулях
+  разом.
 
 - **D1.** `#if defined(WINNT)` — `WINNT` определяет **только MinGW**-тулчейн
   (проверено препроцессором); MSVC его не определяет → под `cl` ветка уходит в
@@ -593,6 +687,61 @@ baseline размера зафиксирован.
       completion с ошибкой, отличной от `ERROR_OPERATION_ABORTED` (напр. RST пира
       до accept), больше не отдаёт делегату негодный сокет, а просто перевзводит
       слот.*
+      *Дополнено (10.09.2026): gtest-покрытие акцептора появилось — набор
+      `tcp_connection_iocp_test.cpp` переписан на связку C_TCPAcceptor +
+      C_TCPConnection (все peer-стороны сценариев обслуживаются акцептором;
+      +5 акцепторных тестов: `listen()` без/повторно → `WSAEINVAL`,
+      повторный `initialize()` → отказ, посторонний пул backlog → отказ,
+      dispose-контракт с причиной `EXPLICIT_DISPOSE` в `onDisposed`). Аргумент
+      «gtest-покрытия акцептора пока нет» снят; `[x]` по-прежнему не ставится
+      до прогона под нагрузкой (echo, 2.5). Замечание из прогонов: при
+      `dispose()` клиента прямо в `onConnect` completion `AcceptEx` — гонка с
+      каскадом сноса (может не диспатчиться вовсе), поэтому в тесте
+      `ConnectToListeningPeerInvokesOnConnectSuccess` факты accept не
+      проверяются — детерминированное покрытие поставки в `PeerData*`/
+      `TwoDrivers`.*
+      *Дополнено (11.09.2026): тесты обновлены под новый контракт акцептора —
+      `onIncoming(C_Socket, const C_Address&)` (адрес пира; тесты проверяют, что
+      удалённая сторона loopback = 127.0.0.1) и `onError(int32_t)`. Новое
+      покрытие: дренирование backlog при teardown — каждый отменённый AcceptEx
+      доходит до делегата как `onError(WSAEINVAL)` (при пуле на 4 слота — ровно
+      4); `initialize()` повторный до `listen()` → `WSAEALREADY` (проверка
+      state/gateway), после `listen()` → `WSAEINVAL` (раньше срабатывает guard
+      непустого пула — задокументированный приоритет проверок), чужой пул →
+      `WSAEINVAL`. `listen()` без initialize/повторный → `WSAEINVAL`. Прогон
+      41/41 PASSED × 3 (Debug, MinGW-тулчейн).*
+      *Итог дня (11.09.2026, после ревью `review/result.md`; изменения не
+      закоммичены, база — `9bb1026`). Логика `onIncoming` переписана: слот
+      освобождается до решения о teardown (D12), успешный перевзвод
+      переиспользует операцию, отказ — `destroy`, единый хвост
+      `armAcceptBacklog()` → `beginTeardown` (ADR-5). `onError` получает только
+      некритичные ошибки при `LISTENING`; «не `LISTENING`» кодируется
+      `WSA_OPERATION_ABORTED` и отфильтровывается — отмены при `dispose()` в
+      `onError` больше **не** приходят (запись выше про `onError(WSAEINVAL)` ×4
+      устарела). Адрес пира: `GetAcceptExSockaddrs` (через
+      `GetExtensionFunction<WSAID_GETACCEPTEXSOCKADDRS>`) →
+      `C_Address::initialize(const os_sockaddr&, uint32_t)` (размер 0 и больше
+      `sockaddr_storage` отклоняются). `initialize()`: сначала состояние
+      (`WSAEALREADY`), затем пул — ёмкость, размер элемента `==
+      sizeof(accept_operation_t)`, **пул пуст** (иначе `WSAEINVAL`). Частичный
+      отказ `armAcceptBacklog` в `listen()` больше не запускает teardown: пул
+      работает деградировавшим и дозаполняется на следующих completion (запись
+      05.09 в этой части устарела). Попутно: `CreateSocket` ставил
+      `TCP_NODELAY = 0` (Nagle не отключался) — исправлено на 1; `ConnectEx`
+      берётся через `GetExtensionFunction<WSAID_CONNECTEX>` (D13).
+      Прогон на ВМ: **39/41 ×3** — падают `AcceptorListenTwiceReturnsInvalid`
+      (ожидает 4 × `onError(WSAEINVAL)`, стало 0) и
+      `AcceptorInitializeAfterListenFails` (ожидает `WSAEINVAL`, стало
+      `WSAEALREADY`): ожидания тестов отражают прежнее поведение, требуют
+      обновления. Открыто по акцептору: двойной отчёт `onError(err)` +
+      `onDisposed(err)` при опустевшем пуле; неинициализированные `local`/
+      `remote` в `GetRemotePeerAddr`; тестов нет на `dispose()` из
+      `onIncoming`, пул на 1 слот, реюз объекта после `onDisposed`;
+      D15; вопросы §8. `[x]` — после echo под нагрузкой (2.5).*
+      *Обновлено (11.09.2026, там же): оба отмеченных теста поправлены —
+      `AcceptorListenTwiceReturnsInvalid` теперь ожидает тихое дренирование
+      (`acceptorErrorCount_ == 0`), `AcceptorInitializeAfterListenReturnsAlready`
+      — `WSAEALREADY`. Прогон на ВМ: **41/41 ×3** (Debug, MinGW-тулчейн).*
 - [ ] **2.5** `examples/echo_client.cpp` + `examples/echo_server.cpp`; гонка
       ≥ 64 МБ без потерь/рассинхрона; зафиксировать размер sample:
       `echo_server: ___ КБ` → установить бюджет.
@@ -711,4 +860,26 @@ baseline размера зафиксирован.
 - **UDP:** вне v1; `socket_factory` не должен её блокировать (см. D3).
 - **TLS:** out of scope (отдельный проект/слой поверх).
 - **Мультипоточный `run()`** (несколько потоков на один IOCP): конструкция
-  зарезервирована (ADR-7), не реализуется в v1.
+  зарезервирована (ADR-7), не реализуется в v1. Кеши extension-функций
+  (`static` в `GetExtensionFunction<GUID>`) не синхронизированы — при
+  мультипоточном `run()` пересмотреть.
+- **Хранилище backlog акцептора и epoll (11.09.2026):** конструктор
+  `C_TCPAcceptorIOCP(reactor, etl::ipool& backlog, delegate)` — IOCP-деталь:
+  на epoll операций нет (`EPOLLIN` на листенере + `accept4` в цикле до
+  `EAGAIN`), пул не нужен, пользовательский код разойдётся (против ADR-10).
+  Вариант: параметр шаблона `C_TCPAcceptor<D, N>` — на IOCP встроенный
+  `etl::pool<accept_operation_s, N>` (без кучи, ADR-4), на epoll — лимит
+  `accept4` за пробуждение. Решить до Этапа 4.
+- **Ошибки accept на epoll:** по accept(2) сетевые ошибки нового соединения
+  (`ECONNABORTED`, `EPROTO`, `ENETDOWN`, `EHOSTUNREACH`…) лечатся повтором как
+  `EAGAIN`; `EMFILE`/`ENFILE`/`ENOBUFS` при LT-epoll дают горячий цикл —
+  нужна защита (резервный fd / снятие `EPOLLIN`). На IOCP аналог — устойчивая
+  ошибка листенера при перевзводе: сейчас сигнал уходит в `onError`, решение
+  за делегатом; защиты на уровне библиотеки нет.
+- **Владение сокетом в `TCPAcceptorDelegate`:** концепт пропускает
+  `onIncoming(const C_Socket&, …)` — сокет тогда молча закрывается при
+  перевзводе. Отрицательное требование (запрет lvalue-вызова) рассмотрено и
+  пока не принято.
+- **Один канал отчёта при опустевшем пуле:** сейчас `onError(err)` и затем
+  `onDisposed(err)`; альтернатива — сообщать ошибку перевзвода после
+  `armAcceptBacklog()` и только при `LISTENING`.

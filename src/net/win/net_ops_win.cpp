@@ -52,7 +52,7 @@ namespace etsl
         return {};
     }
 
-    etl::expected<void*, int32_t> GetExtensionFunction(socket_t fd, GUID guid) noexcept
+    etl::expected<void*, int32_t> GetExtensionFunctionImpl(socket_t fd, GUID guid) noexcept
     {
         DWORD bytes = 0;
         void* fnPtr = nullptr;

@@ -2,6 +2,7 @@
 // Created by sexey on 20.07.2026.
 //
 module;
+#include <etl/span.h>
 #include <etl/expected.h>
 
 export module etsl.net:address;
@@ -17,6 +18,8 @@ export namespace etsl
         C_Address() noexcept = default;
 
         etl::expected<void, int32_t> initialize(const char* ip, uint16_t port) noexcept;
+
+        etl::expected<void, int32_t> initialize(const os_sockaddr& addr, uint32_t size) noexcept;
 
         [[nodiscard]] const os_sockaddr& data() const noexcept { return reinterpret_cast<const os_sockaddr&>(this->storage_); }
 

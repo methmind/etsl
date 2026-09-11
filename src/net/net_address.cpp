@@ -21,4 +21,16 @@ namespace etsl
         this->size_ = *result;
         return {};
     }
+
+    etl::expected<void, int32_t> C_Address::initialize(const os_sockaddr& addr, uint32_t size) noexcept
+    {
+        if (!size || size > sizeof(this->storage_)) {
+            return etl::unexpected(EINVAL);
+        }
+
+        this->size_ = size;
+        memcpy(&this->storage_, &addr, size);
+
+        return {};
+    }
 }

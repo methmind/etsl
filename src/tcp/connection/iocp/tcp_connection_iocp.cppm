@@ -114,7 +114,7 @@ export namespace etsl
             return etl::unexpected(socketCreateResult.error());
         }
 
-        if (const auto err = createConnectOperation(addr, std::move(*socketCreateResult)); !err) {
+        if (const auto err = createConnectOperation(addr, etl::move(*socketCreateResult)); !err) {
             return err;
         }
 
@@ -193,7 +193,7 @@ export namespace etsl
             return err;
         }
 
-        this->fd_ = std::move(fd);
+        this->fd_ = etl::move(fd);
         this->state_ = tcp_connection_state_e::CONNECTED;
         if (const auto err = createReadProbeOperation(); !err) {
             beginTeardown(err.error());
@@ -223,7 +223,7 @@ export namespace etsl
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::ConnectEx(socket_t fd, const C_Address& addr,
         WSAOVERLAPPED& completion) noexcept
     {
-        static auto getResult{GetExtensionFunction(fd, WSAID_CONNECTEX)};
+        auto getResult = GetExtensionFunction<WSAID_CONNECTEX>(fd);
         if (!getResult) {
             return etl::unexpected(getResult.error());
         }
@@ -256,7 +256,7 @@ export namespace etsl
 
         ++this->pendingOps_;
         this->state_ = tcp_connection_state_e::CONNECTING;
-        this->fd_ = std::move(fd);
+        this->fd_ = etl::move(fd);
 
         return {};
     }

@@ -74,7 +74,12 @@ public:
         etsl::C_TCPAcceptor<C_Server>(reactor, backlog, *this) {}
 
 private:
-    void onIncoming(etsl::C_Socket fd) noexcept
+    void onIncoming(etsl::C_Socket fd, const etsl::C_Address& remoteAddr) noexcept
+    {
+        return;
+    }
+
+    void onError(int32_t error) noexcept
     {
         return;
     }

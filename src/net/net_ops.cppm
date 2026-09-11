@@ -16,24 +16,41 @@ export module etsl.net:ops;
 
 import :defs;
 
-export namespace etsl
+namespace etsl
 {
-    enum class socket_shutdown_e : int32_t
+    export enum class socket_shutdown_e : int32_t
     {
         RECEIVE = 0,
         SEND = 1,
         BOTH = 2
     };
 
-    etl::expected<uint32_t, int32_t> ParseIPV4(const char* ip, uint16_t port, os_sockaddr_storage_t& storage) noexcept;
+    export etl::expected<uint32_t, int32_t> ParseIPV4(const char* ip, uint16_t port, os_sockaddr_storage_t& storage) noexcept;
 
-    bool CloseSocket(socket_t fd) noexcept;
+    export bool CloseSocket(socket_t fd) noexcept;
 
-    bool Shutdown(socket_t fd, socket_shutdown_e mode) noexcept;
+    export bool Shutdown(socket_t fd, socket_shutdown_e mode) noexcept;
 
-    etl::expected<void, int32_t> SetNonBlocking(socket_t fd) noexcept;
+    export etl::expected<void, int32_t> SetNonBlocking(socket_t fd) noexcept;
 
 #if defined(_WIN32)
-    etl::expected<void*, int32_t> GetExtensionFunction(socket_t fd, GUID guid) noexcept;
+    etl::expected<void*, int32_t> GetExtensionFunctionImpl(socket_t fd, GUID guid) noexcept;
+
+    export template<GUID guid>
+    etl::expected<void*, int32_t> GetExtensionFunction(socket_t fd) noexcept
+    {
+        static void* fn;
+        if (fn) {
+            return fn;
+        }
+
+        auto result = GetExtensionFunctionImpl(fd, guid);
+        if (!result) {
+            return result;
+        }
+
+        fn = *result;
+        return fn;
+    }
 #endif
 }

@@ -24,7 +24,7 @@ namespace etsl
             return etl::unexpected(err.error());
         }
 
-        constexpr u_long value = 0;
+        constexpr u_long value = 1;
         if (setsockopt(sock.get(), IPPROTO_TCP, TCP_NODELAY,
             reinterpret_cast<const char*>(&value), sizeof(value)) == SOCKET_ERROR) {
             return etl::unexpected(WSAGetLastError());
