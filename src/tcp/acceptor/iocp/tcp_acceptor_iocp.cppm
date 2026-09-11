@@ -156,11 +156,11 @@ export namespace etsl
 
         os_sockaddr* local{};
         os_sockaddr* remote{};
-        uint32_t localSize, remoteSize;
+        INT localSize, remoteSize;
         const auto getAcceptExSockaddrs = reinterpret_cast<LPFN_GETACCEPTEXSOCKADDRS>(*getResult);
         getAcceptExSockaddrs(acceptBuffer, 0, ACCEPT_BUFFER_SIZE,
-            ACCEPT_BUFFER_SIZE, &local, reinterpret_cast<LPINT>(&localSize),
-            &remote, reinterpret_cast<LPINT>(&remoteSize)
+            ACCEPT_BUFFER_SIZE, &local, &localSize,
+            &remote, &remoteSize
         );
 
         if (!remote) {
