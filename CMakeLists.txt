@@ -57,7 +57,6 @@ target_sources(etsl_core
         src/tcp/connection/iocp/tcp_connection_iocp_defs.cppm
         src/tcp/connection/iocp/tcp_connection_iocp.cppm
         src/tcp/acceptor/tcp_acceptor.cppm
-        src/tcp/acceptor/tcp_acceptor_defs.cppm
         src/tcp/acceptor/tcp_acceptor_delegate_trait.cppm
         src/tcp/acceptor/iocp/tcp_acceptor_iocp_defs.cppm
         src/tcp/acceptor/iocp/tcp_acceptor_iocp.cppm

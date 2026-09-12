@@ -27,7 +27,7 @@ namespace etsl
         DISPOSING,
     };
 
-    struct accept_operation_s : C_Reactor::operation_t
+    export struct accept_operation_s : C_Reactor::operation_t
     {
         C_Socket fd{INVALID_SOCKET};
         uint8_t buffer[ACCEPT_BUFFER_SIZE * 2]{};

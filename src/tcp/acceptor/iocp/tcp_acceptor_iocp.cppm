@@ -15,8 +15,8 @@ export module etsl.tcp.acceptor:iocp;
 import etsl.net;
 import etsl.reactor;
 
-import :delegate;
-import :defs_iocp;
+export import :delegate;
+export import :defs_iocp;
 
 export namespace etsl
 {
@@ -148,7 +148,8 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<C_Address, int32_t> C_TCPAcceptorIOCP<delegate_t>::GetRemotePeerAddr(socket_t fd, void* acceptBuffer) noexcept {
+    etl::expected<C_Address, int32_t> C_TCPAcceptorIOCP<delegate_t>::GetRemotePeerAddr(socket_t fd, void* acceptBuffer) noexcept
+    {
         auto getResult = GetExtensionFunction<WSAID_GETACCEPTEXSOCKADDRS>(fd);
         if (!getResult) {
             return etl::unexpected(getResult.error());
@@ -157,10 +158,9 @@ export namespace etsl
         os_sockaddr* local{};
         os_sockaddr* remote{};
         INT localSize, remoteSize;
-        const auto getAcceptExSockaddrs = reinterpret_cast<LPFN_GETACCEPTEXSOCKADDRS>(*getResult);
-        getAcceptExSockaddrs(acceptBuffer, 0, ACCEPT_BUFFER_SIZE,
-            ACCEPT_BUFFER_SIZE, &local, &localSize,
-            &remote, &remoteSize);
+        reinterpret_cast<LPFN_GETACCEPTEXSOCKADDRS>(*getResult)(acceptBuffer, 0,
+            ACCEPT_BUFFER_SIZE,ACCEPT_BUFFER_SIZE, &local,
+            &localSize,&remote, &remoteSize);
 
         if (!remote) {
             return etl::unexpected(WSAEINVAL);
@@ -208,8 +208,10 @@ export namespace etsl
 
         C_Reactor::FlushOperation(operation);
         operation.fd = etl::move(*newDescriptor);
-        operation.callback = decltype(accept_operation_t::callback)::create<
-           C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this);
+        if (!operation.callback.is_valid()) {
+            operation.callback = decltype(accept_operation_t::callback)::create<
+               C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this);
+        }
 
         if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
             return err;

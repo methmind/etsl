@@ -11,7 +11,7 @@ export module etsl.reactor:iocp;
 import etsl.net;
 import etsl.timer;
 
-import :iocp_defs;
+export import :iocp_defs;
 
 export namespace etsl
 {

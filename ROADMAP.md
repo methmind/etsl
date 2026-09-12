@@ -61,8 +61,10 @@
   собирать `etsl_core` и тест отдельно.
 - MSVC (`cl`) **не поддерживается** и не планируется; проект ориентирован
   исключительно на Clang.
-- ETL 20.48.1 (`external/etl`, submodule; обновлён с 20.47.1 и застейджен
-  28.08.2026 — бамп уменьшил MinSizeRel-dec на 1 472 байта, см. ADR-9).
+- ETL **20.49.0** (`external/etl`, submodule; обновлён 12.09.2026 с 20.48.1 —
+  закрывает D14, `expected::operator*() const&`/`&&`; на размер повлиял на
+  −32 байта, прогон после бампа 44/44 ×3 + обе нагрузки echo. Ранее: 20.47.1 →
+  20.48.1 застейджен 28.08.2026, тот бамп дал −1 472 байта, см. ADR-9).
   Исключения внутри ETL выключены по умолчанию (`ETL_THROW_EXCEPTIONS`
   не определён, `external/etl/include/etl/platform.h:287`)
   — дополнительных макросов для ETL не нужно; нужно лишь компилировать сам проект
@@ -150,7 +152,14 @@ platform connection в `reactor` или `socket` запрещено.
   EOF → teardown → `onDisconnect(0)`; прочие ошибки `recv` → teardown +
   информационный sync-код, терминальный колбэк доедет отложенно. После
   возврата `onReadyRead()` проба взводится заново — level-triggered
-  семантика, пейсинг через async completion, busy loop невозможен.
+  семантика, пейсинг через async completion. *Уточнено 12.09.2026:* «busy loop
+  невозможен» верно, **только пока `onReadyRead` дочитывает сокет до
+  `WSAEWOULDBLOCK`**. Если положить данные некуда (все буферы пользователя
+  заняты незавершёнными `WSASend`), безусловный перевзвод пробы даёт холостой
+  цикл: замер с неотвечающим пиром — 16 091 573 вызова `onReadyRead` за ~10 с,
+  из них 16 091 403 без единого прочитанного байта (ядро под 100%); у
+  здорового клиента — 2–10 таких вызовов на сессию. Лечится паузой взвода
+  чтения (3.3).
   `MSG_PEEK`-фильтрация удалена: на IOCP probe срабатывает на реальный приём,
   EOF детектится через `read()` → `unexpected(0)`.
 - **Запись (полностью проактивная):** `send(span, send_operation_t&)` немедленно
@@ -196,8 +205,10 @@ IOCP reactor доставляет raw completion делегату операци
 - `onConnect(int32_t error)` — завершение `ConnectEx` (или неудачный коннект
   после teardown). `adopt()` его не вызывает: сокет принят уже подключённым,
   вызывающий знает это синхронно, — первое событие делегата принятого сокета
-  `onReadyRead` либо `onDisconnect`, в т.ч. `onDisconnect(err)` при неудаче
-  взвода read-пробы внутри `adopt` (07.09.2026);
+  `onReadyRead` либо `onDisconnect`. **Пересмотрено 12.09.2026:** любой отказ
+  `adopt()` синхронен и терминальных колбэков не порождает — при неудаче взвода
+  read-пробы соединение откатывается (сокет закрыт, состояние `NONE`), как в
+  `connect()`. Прежняя запись 07.09 («придёт `onDisconnect(err)`») недействительна;
 - `onReadyRead()` — данные доступны; пользователь зовёт `read(span)`;
 - `onCommit(operation_t&, int32_t error)` — терминальное завершение
   send-операции, включая отменённую (`ERROR_OPERATION_ABORTED` при dispose —
@@ -404,8 +415,8 @@ src/
 │                                     # всех публичных модулей (import etsl;)
 ├── init/                             # инициализация подсистемы (etsl.init)
 │   ├── initializer.cppm              # контракт: декларация Initialize(), без ОС
-│   └── win/                          # impl-юнит: WSAStartup/WSACleanup
-│                                     # (C_WSAInitializer — module-local)
+│   └── win/                          # impl-юнит: WSAStartup (без WSACleanup —
+│                                     # плоский static bool, D16)
 ├── net/                              # словарь сети + ос-шины, без фич внутри
 │   ├── net.cppm                      # etsl.net: export import :defs :ops
 │   │                                 # :address :socket :factory
@@ -426,7 +437,6 @@ src/
 │   │   └── iocp/                     # C_TCPConnectionIOCP + defs_iocp
 │   └── acceptor/
 │       ├── tcp_acceptor.cppm                   # etsl.tcp.acceptor — alias C_TCPAcceptor
-│       ├── tcp_acceptor_defs.cppm              # :defs — пока пуст
 │       ├── tcp_acceptor_delegate_trait.cppm    # concept TCPAcceptorDelegate
 │       └── iocp/                     # C_TCPAcceptorIOCP + :defs_iocp
 │                                     # (accept_operation_s, состояния, буфер AcceptEx)
@@ -442,7 +452,10 @@ src/
 └── util/                             # noncopyable.h, etl_chrono.cpp
 
 test/tcp_connection_iocp_test.cpp  # gtest-набор connection + acceptor (44 теста)
+examples/echo_server.cpp           # 2.5: эхо-сервер (акцептор + сессии)
+examples/echo_client.cpp           # 2.5: нагрузочный клиент со сверкой потока
 review/result.md                   # результаты ревью (не код)
+review/next-steps.md               # план фиксов и размышления
 ```
 
 Соглашения: имя файла модуля == имя модуля; `export module <domain>[.<sub>]`;
@@ -464,12 +477,22 @@ namespace `etsl`; классы с префиксом `C_`, методы `snake_c
 партиции — без префикса. Вход пользователя: `import etsl;` (или точечно
 `import etsl.net;` и т.п.).
 
+Правило партиций (D15): **все интерфейсные партиции модуля обязаны быть прямо
+или косвенно экспортированы первичным интерфейсом** ([module.unit]/3; нарушение
+ill-formed, NDR — clang его не диагностирует). Практически это значит сквозной
+`export import` по всей цепочке: primary → `:iocp` → `:iocp_defs`/`:defs_iocp`/
+`:delegate`. Реэкспорт партиции не делает её содержимое публичным: наружу
+уходит только то, что помечено `export` внутри самой партиции, поэтому
+внутренние состояния и константы держатся в обычном `namespace etsl` без
+`export`.
+
 ---
 
-## 5. Известные дефекты (обновлено 11.09.2026)
+## 5. Известные дефекты (обновлено 12.09.2026)
 
 D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оставлены как история.
-Подробности D12–D15 — `review/result.md`.
+Подробности D12–D16 — `review/result.md`; план работ и размышления —
+`review/next-steps.md`.
 
 - **D9** *(закрыт 25.08.2026)*: deploy-хук уже использует ключ `~/.ssh/win-dev`
   — деплой Debug- и MinSizeRel-сборок на ВМ `win-dev` прошёл успешно.
@@ -507,22 +530,46 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   аварийно завершался на 3-м тесте. Фикс — `template<GUID guid>` (кеш на
   специализацию, ошибка не кешируется); прогон 40/40 ×3.
 
-- **D14** *(обойдён, 11.09.2026)*: дефект ETL 20.48.1 — const-перегрузка
-  `etl::expected<T,E>::operator*()` (`external/etl/include/etl/expected.h:749`)
-  при отсутствии значения делает `return ETL_NULLPTR` через `const T&`; для
-  `T = void*` — ссылка на временный объект (`-Wreturn-stack-address`), для
-  прочих `T` перегрузка не инстанцируема. Обход: не разыменовывать
-  `const expected` через `*` — брать `.value()` (у `value() const&` такой ветки
-  нет) или не объявлять результат `const`. Кандидат в апстрим.
+- **D14** *(закрыт 12.09.2026 бампом ETL до 20.49.0)*: дефект ETL 20.48.1 —
+  const-перегрузка `etl::expected<T,E>::operator*()`
+  (`external/etl/include/etl/expected.h:749`) при отсутствии значения делала
+  `return ETL_NULLPTR` через `const T&`; для `T = void*` — ссылка на временный
+  объект (`-Wreturn-stack-address`), для прочих `T` перегрузка не
+  инстанцируема. В апстриме исправлено («Fix expected::operator*() const& and
+  && failing to compile»): в 20.49.0 обе перегрузки используют обычный
+  `ETL_ASSERT`, `ETL_NULLPTR` остался только в `operator->`, где возврат
+  указателя законен. Обход `.value()` в коде можно не снимать — он корректен и
+  при исправленной версии.
 
-- **D15** *(открыт, 11.09.2026)*: модульная структура tcp-фич (и connection, и
-  acceptor): `:delegate` — implementation-партиция, импортируемая в
-  интерфейсную `:iocp` (clang:
-  `-Wimport-implementation-partition-unit-in-interface-unit` на
-  `tcp_acceptor_iocp.cppm:18`); интерфейсные партиции `:iocp`/`:defs_iocp`
-  primary interface не реэкспортирует (`import :iocp;` без `export`) — по
-  [module.unit]/3 ill-formed, NDR. Clang пока собирает; чинить в обоих модулях
-  разом.
+- **D15** *(закрыт 12.09.2026)*: первичные интерфейсы не реэкспортировали свои
+  интерфейсные партиции — по [module.unit]/3 ill-formed, NDR (clang молчит).
+  Предупреждение `-Wimport-implementation-partition-unit-in-interface-unit`
+  было снято раньше переводом `:delegate` в интерфейсные партиции, но суть
+  оставалась. Ревизия всех модулей показала, что задеты **три**, а не два:
+  `etsl.reactor` (`:trait`, `:iocp`, `:iocp_defs`), `etsl.tcp.connection`
+  (`:iocp`, `:defs_iocp`) и `etsl.tcp.acceptor` (`:iocp`); чисты были только
+  `etsl.net` и `etsl.timer`. Фикс — сквозной `export import` по цепочке
+  primary → `:iocp` → `:iocp_defs`/`:defs_iocp`/`:delegate`/`:trait`.
+  Внутренности наружу при этом не уехали: в `:iocp_defs`/`:defs_iocp` сущности
+  объявлены в обычном `namespace etsl` без `export` (состояния, константы,
+  `operation_iocp_s`), поэтому реэкспорт делает их достижимыми, но не
+  публичными. Единственное исключение — `accept_operation_s`, помеченный
+  `export` сознательно: пользователь обязан завести под него `etl::pool`.
+
+- **D16** *(закрыт 12.09.2026)*: `static C_WSAInitializer wsa;` в
+  `Initialize()` — function-local static с нетривиальным деструктором. На
+  MinGW guard libstdc++ тянул EH/unwind/`__cxa_demangle`/winpthread: **+134 КБ**
+  к любому бинарю (12 276 → 146 512 на синтетическом примере;
+  `constexpr`-конструктор не спасал — guard нужен и для регистрации
+  деструктора). Фикс — плоский `static bool` с константной инициализацией плюс
+  сознательный отказ от `WSACleanup` (как в libuv; обоснование — в комментарии
+  `win_initializer.cpp`). Контрольный замер того же TU теми же флагами: в
+  версии до правки `__cxa_guard_acquire` ×1 и `WSACleanup` ×1, после — по нулю,
+  `initialized` лежит в `.bss`. По всей `libetsl_core.a` счётчики
+  `__cxa_guard_acquire`, `__cxa_atexit`, `__gxx_personality`, `_Unwind_Resume`,
+  `__cxa_demangle`, `pthread_once` — нули. Цена решения: потокобезопасность
+  первого вызова потеряна (в рамках ADR-7 v1 допустимо). Остаток — снять цифру
+  в байтах: MinSizeRel-каталога на MinGW нет, см. 2.5.
 
 - **D1.** `#if defined(WINNT)` — `WINNT` определяет **только MinGW**-тулчейн
   (проверено препроцессором); MSVC его не определяет → под `cl` ветка уходит в
@@ -552,7 +599,9 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   применения.
 - **D8.** `LOOP_POOL`/`createLoop`/`loop_destructor_s` — избыточны (ADR-4).
   Event loop становится value type; `C_WSAInitializer` переезжает в
-  `initialize()` как function-local static.
+  `initialize()` как function-local static. *(Вторая половина решения
+  пересмотрена в D16: function-local static с нетривиальным деструктором стоил
+  +134 КБ на MinGW; `C_WSAInitializer` удалён.)*
 
 ---
 
@@ -659,7 +708,7 @@ baseline размера зафиксирован.
       97 091 байт, из которых 91 366 — CRT-подложка пустого `main`, т.е. вклад
       кода etsl ≈ **5,7 КБ**. Рост библиотеки нет; разница с июлём — только
       способ линковки CRT.*
-- [ ] **2.4** `tcp_server`: `listen(backlog)`, пул posted `AcceptEx` (буфер
+- [x] **2.4** `tcp_server`: `listen(backlog)`, пул posted `AcceptEx` (буфер
       адресов `(sizeof(sockaddr_storage)+16)*2` на accept), `onIncoming` с
       готовым соединением подключённого пира (делегатная модель, ADR-3), repost.
       `SO_EXCLUSIVEADDRUSE` вместо `SO_REUSEADDR`.
@@ -745,7 +794,7 @@ baseline размера зафиксирован.
       `onDisposed(err)`~~ (штатно, §8); ~~неинициализированные `local`/
       `remote` в `GetRemotePeerAddr`~~ (исправлено 11.09); тестов нет на `dispose()` из
       `onIncoming`, пул на 1 слот, реюз объекта после `onDisposed` (добавлены 11.09, 44/44);
-      D15; вопросы §8. `[x]` — после echo под нагрузкой (2.5).*
+      вопросы §8. `[x]` — после echo под нагрузкой (2.5).*
       *Обновлено (11.09.2026, там же): оба отмеченных теста поправлены —
       `AcceptorListenTwiceReturnsInvalid` теперь ожидает тихое дренирование
       (`acceptorErrorCount_ == 0`), `AcceptorInitializeAfterListenReturnsAlready`
@@ -770,9 +819,42 @@ baseline размера зафиксирован.
       вторая пара `onDisposed(EXPLICIT_DISPOSE)` + пустой пул. Прогон на ВМ:
       **44/44 ×3** (Debug, MinGW-тулчейн). Открытых пунктов в акцепторном
       gtest-покрытии не осталось.*
+      **Закрыто 12.09.2026:** условием `[x]` был прогон под нагрузкой — он
+      выполнен эхо-парой 2.5 (8×64 МиБ ×3 и 512 МиБ одним соединением, сессии
+      закрываются без ошибок, см. 2.5). Оставшееся по акцептору не блокирует
+      пункт: m3 и косметика (`review/next-steps.md` §1.4); D15 закрыт 12.09.2026.
 - [ ] **2.5** `examples/echo_client.cpp` + `examples/echo_server.cpp`; гонка
       ≥ 64 МБ без потерь/рассинхрона; зафиксировать размер sample:
       `echo_server: ___ КБ` → установить бюджет.
+      *В работе (12.09.2026): примеры написаны и прогнаны, бюджет не зафиксирован.
+      Оба файла платформенно-нейтральны (только `import etsl` + ETL, ноль
+      заголовков ОС — заодно проверка DoD Этапа 4). `echo_server [port] [sessions]`:
+      акцептор с пулом на 16 `AcceptEx`, до 16 сессий через `adopt()`, в сессии
+      4 send-слота по 16 КБ (чтение — сразу в буфер слота, эхо без копирования),
+      печатает адрес пира, после `sessions` сессий штатно сносится.
+      `echo_client [host] [port] [mib] [connections]`: до 8 соединений, окно
+      4×16 КБ, детерминированный поток (хеш смещения) сверяется байт-в-байт,
+      сторожевой таймер реактора рвёт прогон после 10 с без прогресса.
+      **Прогоны на ВМ (Debug, MinGW):** 1×64 МиБ — PASS, 349 мс, 183 МиБ/с;
+      8×64 МиБ — PASS ×3, ~2,9 с, ~176 МиБ/с; 1×512 МиБ — PASS, 180 МиБ/с;
+      сессии сервера закрываются без ошибок. Негативные проверки: сверка с
+      чужим seed → `mismatch at offset 1`; без сервера → `connect failed 10061`,
+      код возврата 1.
+      **Размер (MinSizeRel, флаги ADR-9, MinGW, `dec`):** `echo_server` 155 064,
+      `echo_client` 154 264, `etsl.exe` 152 704 при подложке пустого `main`
+      12 276 (после бампа ETL до 20.49.0 — 155 032 и 154 264, то есть −32 байта).
+      Из них **+134 КБ — не код etsl**: `static C_WSAInitializer` внутри
+      `Initialize()` требовал guard libstdc++, а тот тянет EH/unwind/
+      `__cxa_demangle`/winpthread (замеры и варианты — `review/next-steps.md` §1.1).
+      Без guard `echo_server` = 48 532, из них ~28 КБ — `printf` (mingw_pformat),
+      вклад etsl + логики примера ≈ 8 КБ.
+      **Цифры выше сняты до фикса D16 (12.09.2026) и более не актуальны:**
+      guard устранён, что подтверждено символьно (`__cxa_guard_acquire` в
+      `libetsl_core.a` — 0), но байты не перемеряны.
+      **Не сделано:** примеры не подключены к `CMakeLists.txt` (проверялись
+      внешним проектом через `add_subdirectory`), нет MinSizeRel-каталога на
+      MinGW — без него бюджет не зафиксировать; это единственное, что осталось
+      для закрытия 2.5.*
 - [x] **2.6** *(добавлено постфактум)* gtest-набор `test/tcp_connection_iocp_test.cpp`
       (GoogleTest v1.17.0 FetchContent, опция `ETSL_BUILD_TESTS`; кросс-сборка,
       прогон на Windows-ВМ): 30 тестов — teardown/dispose-контракт, connect и
@@ -817,6 +899,13 @@ baseline размера зафиксирован.
       `onDisconnect(0)`); полузакрытие корректно обрабатывается.
 - [ ] **3.3** Backpressure: high-watermark tx-буфера, пауза взвода чтения,
       пока tx не проседает (защита от медленного пира).
+      *Уточнено 12.09.2026 по замерам echo (см. ADR-2 и `review/next-steps.md`
+      §2.1): нужен платформенно-нейтральный `pauseRead()`/`resumeRead()` — на
+      IOCP пауза = не перевзводить пробу после `onReadyRead`, на epoll — снять
+      и вернуть `EPOLLIN`. Без него «подождать освобождения буфера» = холостой
+      цикл на 100% ядра; вектор DoS: пир шлёт и не читает. Аналоги:
+      `uv_read_stop`, `QAbstractSocket::setReadBufferSize`; в asio проблемы нет
+      — следующий read инициирует пользователь.*
 - [ ] **3.4** `to_portable()` для частых кодов: `WSAEWOULDBLOCK`,
       `WSAECONNREFUSED`, `WSAECONNRESET`, `WSAECONNABORTED`, `WSAETIMEDOUT`,
       `WSAEHOSTUNREACH`.

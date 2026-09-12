@@ -3,10 +3,8 @@
 //
 export module etsl.tcp.connection;
 
-export import :defs;
-
 #if defined(_WIN32)
-import :iocp;
+export import :iocp;
 export namespace etsl
 {
     template<typename T>

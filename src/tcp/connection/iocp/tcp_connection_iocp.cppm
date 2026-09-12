@@ -16,8 +16,8 @@ export module etsl.tcp.connection:iocp;
 import etsl.reactor;
 import etsl.net;
 
-import :defs;
-import :delegate;
+export import :defs;
+export import :delegate;
 import :defs_iocp;
 
 export namespace etsl
