@@ -7,15 +7,16 @@
 
 extern "C" uint64_t etl_get_steady_clock()
 {
-    LARGE_INTEGER frequency;
-    LARGE_INTEGER counter;
+    static const uint64_t freq = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<uint64_t>(f.QuadPart);
+    }();
 
-    QueryPerformanceFrequency(&frequency);
+    LARGE_INTEGER counter;
     QueryPerformanceCounter(&counter);
 
     uint64_t qpc = counter.QuadPart;
-    uint64_t freq = frequency.QuadPart;
-
     uint64_t seconds = qpc / freq;
     uint64_t remainder = qpc % freq;
 

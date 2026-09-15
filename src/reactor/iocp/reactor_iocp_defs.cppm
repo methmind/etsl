@@ -14,16 +14,15 @@ export module etsl.reactor:iocp_defs;
 
 namespace etsl
 {
-    struct operation_iocp_s : WSAOVERLAPPED // NOLINT(*-pro-type-member-init)
+    export struct operation_iocp_s : WSAOVERLAPPED // NOLINT(*-pro-type-member-init)
     {
         etl::delegate<void(operation_iocp_s& operation, uint32_t bytes, int32_t error)> callback{};
+        bool inFlight{false};
 
         ETSL_DEFAULT_NON_COPYABLE_NON_MOVABLE(operation_iocp_s)
     };
 
-    using task_iocp_s = operation_iocp_s;
-
-    struct dispose_operation_iocp_s : etl::bidirectional_link<0>
+    export struct dispose_operation_iocp_s : etl::bidirectional_link<0>
     {
         etl::delegate<void()> callback{};
     };

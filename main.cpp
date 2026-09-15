@@ -92,6 +92,11 @@ private:
     etl::pool<accept_operation_t, 1> backlog{};
 };
 
+void timer_callback()
+{
+    return;
+}
+
 int main()
 {
     if (!etsl::Initialize()) {
@@ -103,7 +108,12 @@ int main()
         return err.error();
     }
 
-    etsl::C_Address gateAddr;
+    etsl::timer_callback_t timerCallback(timer_callback);
+    etsl::C_Timer timer(timerCallback); etsl::C_Timer timer2(timerCallback);
+    reactor.schedule(timer, etsl::timer_duration_t(1000));
+    reactor.schedule(timer2, etsl::timer_duration_t(3000));
+
+    /*etsl::C_Address gateAddr;
     if (const auto err = gateAddr.initialize("0.0.0.0", 3730); !err) {
         return err.error();
     }
@@ -125,7 +135,7 @@ int main()
     C_Test test(reactor);
     if (const auto err = test.exec(address); !err) {
         return err.error();
-    }
+    }*/
 
     reactor.run();
     return 0;

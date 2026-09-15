@@ -6,4 +6,4 @@ export module etsl.timer;
 
 export import :defs;
 export import :impl;
-export import :bucket;
+export import :queue;

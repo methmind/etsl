@@ -206,14 +206,21 @@ export namespace etsl
             return etl::unexpected(newDescriptor.error());
         }
 
-        C_Reactor::FlushOperation(operation);
         operation.fd = etl::move(*newDescriptor);
         if (!operation.callback.is_valid()) {
             operation.callback = decltype(accept_operation_t::callback)::create<
                C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this);
         }
 
-        if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
+        if (const auto err = C_Reactor::Assign(operation,
+            [this](accept_operation_t& operation) -> etl::expected<void, int32_t> {
+                if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
+                    return err;
+                }
+
+                return {};
+            }
+        ); !err) {
             return err;
         }
 

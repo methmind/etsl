@@ -46,6 +46,10 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<void, int32_t> adopt(C_Socket&& fd) noexcept;
 
+        [[nodiscard]] etl::expected<void, int32_t> suspendReading() noexcept;
+
+        [[nodiscard]] etl::expected<void, int32_t> resumeReading() noexcept;
+
     private:
         [[nodiscard]] static etl::expected<void, int32_t> EphemeralBind(socket_t fd) noexcept;
 
@@ -77,10 +81,11 @@ export namespace etsl
         C_Reactor::dispose_operation_t disposeOperation_{};
 
         C_Socket fd_;
-        tcp_connection_state_e state_;
         uint16_t pendingOps_;
+        tcp_connection_state_e state_;
 
         bool wasConnected_;
+        bool suspendReading_;
         int32_t cachedDisposeReason_;
 
         delegate_t& delegate_;
@@ -89,7 +94,7 @@ export namespace etsl
     template<typename delegate_t>
     C_TCPConnectionIOCP<delegate_t>::C_TCPConnectionIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept :
         reactor_(reactor), fd_(INVALID_SOCKET), state_(tcp_connection_state_e::NONE), pendingOps_(0),
-        wasConnected_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
+        wasConnected_(false), suspendReading_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
     {
         static_assert(TCPConnectionDelegate<delegate_t>, "Delegate must satisfy tcp connection delegate trait!");
 
@@ -210,6 +215,41 @@ export namespace etsl
     }
 
     template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::suspendReading() noexcept
+    {
+        if (this->state_ != tcp_connection_state_e::CONNECTED) {
+            return etl::unexpected(WSAENOTCONN);
+        }
+
+        if (this->suspendReading_) {
+            return etl::unexpected(WSAEALREADY);
+        }
+
+        this->suspendReading_ = true;
+        return {};
+    }
+
+    template<typename delegate_t>
+    etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::resumeReading() noexcept
+    {
+        if (this->state_ != tcp_connection_state_e::CONNECTED) {
+            return etl::unexpected(WSAENOTCONN);
+        }
+
+        if (!this->suspendReading_) {
+            return etl::unexpected(WSAEALREADY);
+        }
+
+        this->suspendReading_ = false;
+        if (const auto err = createReadProbeOperation(); !err && err.error() != WSAEALREADY) {
+            beginTeardown(err.error());
+            return err;
+        }
+
+        return {};
+    }
+
+    template<typename delegate_t>
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::EphemeralBind(socket_t fd) noexcept
     {
         constexpr os_sockaddr_in_t addrAny{
@@ -255,8 +295,11 @@ export namespace etsl
             return err;
         }
 
-        C_Reactor::FlushOperation(this->readinessOperation_);
-        if (const auto err = ConnectEx(fd.get(), addr, this->readinessOperation_); !err) {
+        if (const auto err = C_Reactor::Assign(this->readinessOperation_,
+            [&fd, &addr](C_Reactor::operation_t& operation) -> etl::expected<void, int32_t> {
+                return ConnectEx(fd.get(), addr, operation);
+            }
+        ); !err) {
             return err;
         }
 
@@ -274,14 +317,21 @@ export namespace etsl
             return etl::unexpected(WSAENOTCONN);
         }
 
-        DWORD flags = 0;
-        WSABUF tmp{};
+        if (const auto err = C_Reactor::Assign(this->readinessOperation_,
+            [this](C_Reactor::operation_t& operation) -> etl::expected<void, int32_t> {
+                DWORD flags = 0;
+                WSABUF tmp{};
 
-        C_Reactor::FlushOperation(this->readinessOperation_);
-        if (WSARecv(this->fd_.get(), &tmp, 1, nullptr, &flags, &this->readinessOperation_, nullptr) == SOCKET_ERROR) {
-            if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
-                return etl::unexpected(err);
+                if (WSARecv(this->fd_.get(), &tmp, 1, nullptr, &flags, &operation, nullptr) == SOCKET_ERROR) {
+                    if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
+                        return etl::unexpected(err);
+                    }
+                }
+
+                return {};
             }
+        ); !err) {
+            return err;
         }
 
         ++this->pendingOps_;
@@ -295,16 +345,23 @@ export namespace etsl
             return etl::unexpected(WSAENOTCONN);
         }
 
-        WSABUF buffer = {
-            .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
-            .buf = reinterpret_cast<char*>(const_cast<uint8_t*>(operation.content.data() + operation.transferred)),
-        };
+        if (const auto err = C_Reactor::Assign(operation,
+            [this](send_operation_t& operation) -> etl::expected<void, int32_t> {
+                WSABUF buffer = {
+                    .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
+                    .buf = reinterpret_cast<char*>(const_cast<uint8_t*>(operation.content.data() + operation.transferred)),
+                };
 
-        C_Reactor::FlushOperation(operation);
-        if (WSASend(this->fd_.get(), &buffer, 1, nullptr, 0, &operation, nullptr) == SOCKET_ERROR) {
-            if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
-                return etl::unexpected(err);
+                if (WSASend(this->fd_.get(), &buffer, 1, nullptr, 0, &operation, nullptr) == SOCKET_ERROR) {
+                    if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
+                        return etl::unexpected(err);
+                    }
+                }
+
+                return {};
             }
+        ); !err) {
+            return err;
         }
 
         ++this->pendingOps_;
@@ -351,7 +408,15 @@ export namespace etsl
     template<typename delegate_t>
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::invokeReadyRead() noexcept
     {
+        if (this->suspendReading_) {
+            return {}; // Подавление хвоста, если suspendReading не успели вызывать до взвода операции.
+        }
+
         this->delegate_.onReadyRead();
+        if (this->suspendReading_ || this->readinessOperation_.inFlight) {
+            return {};
+        }
+
         return createReadProbeOperation();
     }
 
@@ -428,17 +493,18 @@ export namespace etsl
         assert(this->pendingOps_ == 0 && "Dangling operations!");
 
         auto stackReason = this->cachedDisposeReason_;
+        auto stackWasConnected = this->wasConnected_;
+        this->wasConnected_ = false;
+        this->suspendReading_ = false;
         this->state_ = tcp_connection_state_e::NONE;
         this->cachedDisposeReason_ = INVALID_CACHE_VALUE;
 
         if (stackReason == EXPLICIT_DISPOSE) {
             this->delegate_.onDisposed();
         } else {
-            (this->wasConnected_) ?
+            (stackWasConnected) ?
                this->delegate_.onDisconnect(stackReason) :
                this->delegate_.onConnect(stackReason);
-
-            this->wasConnected_ = false;
         }
     }
 }

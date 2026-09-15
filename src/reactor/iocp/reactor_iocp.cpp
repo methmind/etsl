@@ -5,6 +5,7 @@ module;
 #include <winsock2.h>
 #include <windows.h>
 
+#include <etl/chrono.h>
 #include "etl/expected.h"
 
 module etsl.reactor;
@@ -18,11 +19,6 @@ namespace etsl
         if (this->iocp_ != nullptr) {
             CloseHandle(this->iocp_);
         }
-    }
-
-    void C_ReactorIOCP::FlushOperation(operation_t& operation) noexcept
-    {
-        memset(&operation, 0, sizeof(WSAOVERLAPPED));
     }
 
     int32_t C_ReactorIOCP::TranslateError(const C_Socket& fd, const operation_t& operation, int32_t iocpError) noexcept
@@ -68,7 +64,7 @@ namespace etsl
         this->disposable_.push_back(operation);
     }
 
-    etl::expected<void, int32_t> C_ReactorIOCP::post(task_t& task) noexcept
+    etl::expected<void, int32_t> C_ReactorIOCP::post(operation_t& task) noexcept
     {
         if (!PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::TASK), &task)) {
             return etl::unexpected(static_cast<int32_t>(GetLastError()));
@@ -77,14 +73,14 @@ namespace etsl
         return {};
     }
 
-    void C_ReactorIOCP::addTimer(C_Timer& timer) noexcept
+    void C_ReactorIOCP::schedule(C_Timer& timer, const timer_duration_t& duration) noexcept
     {
-        this->timerBucket_.add(timer);
+        this->timerQueue_.schedule(timer, duration);
     }
 
-    void C_ReactorIOCP::removeTimer(C_Timer& timer) noexcept
+    void C_ReactorIOCP::unschedule(C_Timer& timer) noexcept
     {
-        this->timerBucket_.remove(timer);
+        this->timerQueue_.unschedule(timer);
     }
 
     void C_ReactorIOCP::run() noexcept
@@ -94,18 +90,18 @@ namespace etsl
             ULONG_PTR completionKey = 0;
             WSAOVERLAPPED* overlapped = nullptr;
 
-            const auto timeout = (this->disposable_.empty()) ? this->timerBucket_.nextTimeout(clock_t::now()) : 0;
-            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, timeout);
+            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, nextTimeout());
             const auto ioError = (ioStatus) ? 0 : static_cast<int32_t>(GetLastError());
-
-            const auto currentTime = clock_t::now();
-            while (const auto timer = this->timerBucket_.pop(currentTime)) {
-                timer->execute();
-            }
 
             if (overlapped) {
                 const auto operation = reinterpret_cast<operation_t*>(overlapped);
+                operation->inFlight = false;
                 operation->callback(*operation, bytesTransferred, ioError);
+            }
+
+            const auto currentTime = steady_clock_t::now();
+            while (const auto timer = this->timerQueue_.pop(currentTime)) {
+                timer->execute();
             }
 
             while (const auto disposable = popDisposable()) {
@@ -118,6 +114,31 @@ namespace etsl
     {
         this->halt_ = true;
         PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN), nullptr);
+    }
+
+    uint32_t C_ReactorIOCP::nextTimeout() const noexcept
+    {
+        if (!this->disposable_.empty()) {
+            return 0;
+        }
+
+        const auto nearestTimepoint = this->timerQueue_.nearest();
+        if (!nearestTimepoint) {
+            return INFINITE;
+        }
+
+        const auto currentTime = steady_clock_t::now();
+        if (*nearestTimepoint <= currentTime) {
+            return 0;
+        }
+
+        const auto timeout = etl::ceil<timer_duration_t>(*nearestTimepoint - currentTime).count();
+        if (timeout >= INFINITE) {
+            assert(false && "Timeout is too long!");
+            return INFINITE;
+        }
+
+        return static_cast<uint32_t>(timeout);
     }
 
     const C_ReactorIOCP::dispose_operation_t* C_ReactorIOCP::popDisposable() noexcept

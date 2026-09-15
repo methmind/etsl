@@ -263,7 +263,7 @@ private:
 class TCPConnectionIOCPTest : public ::testing::Test
 {
 public:
-    using clock_t = etsl::clock_t;
+    using clock_t = etsl::steady_clock_t;
     using timer_callback_t = etsl::timer_callback_t;
     using C_Address = etsl::C_Address;
     using C_Reactor = etsl::C_Reactor;
@@ -426,6 +426,13 @@ public:
             }
         }
 
+        // Backpressure pattern: suspend from inside the callback — the probe
+        // rearm in invokeReadyRead's tail must see the flag and skip.
+        if (suspendReadingOnReadyRead_) {
+            suspendReadingOnReadyRead_ = false;
+            suspendOnReadyReadOk_ = driver_->suspendReading().has_value();
+        }
+
         if (disposeAfterReadyReads_ > 0 && readyReadCount_ >= disposeAfterReadyReads_) {
             driver_->dispose();
             return;
@@ -520,6 +527,11 @@ public:
             ScheduleDispose(scheduleDisposeOnConnectMs_);
             scheduleDisposeOnConnectMs_ = -1;
             return;
+        }
+
+        if (stepsOnConnect_ && error == 0) {
+            stepsOnConnect_ = false;
+            ScheduleStep(30, stepsOnConnectFirst_);
         }
 
         // A failed connect is a terminal state of the connection object; a
@@ -647,17 +659,21 @@ protected:
     void TearDown() override
     {
         if (actionTimer_ && actionTimer_->is_linked()) {
-            reactor_.removeTimer(*actionTimer_);
+            reactor_.unschedule(*actionTimer_);
         }
         if (timeoutTimer_ && timeoutTimer_->is_linked()) {
-            reactor_.removeTimer(*timeoutTimer_);
+            reactor_.unschedule(*timeoutTimer_);
         }
         if (stopTimer_ && stopTimer_->is_linked()) {
-            reactor_.removeTimer(*stopTimer_);
+            reactor_.unschedule(*stopTimer_);
+        }
+        if (stepTimer_ && stepTimer_->is_linked()) {
+            reactor_.unschedule(*stepTimer_);
         }
         actionTimer_.reset();
         timeoutTimer_.reset();
         stopTimer_.reset();
+        stepTimer_.reset();
         driver_.reset();
         for (auto& slot : peers_) {
             slot.Release();
@@ -685,7 +701,7 @@ protected:
         reactor_.run();
 
         if (timeoutTimer_ && timeoutTimer_->is_linked()) {
-            reactor_.removeTimer(*timeoutTimer_);
+            reactor_.unschedule(*timeoutTimer_);
         }
         timeoutTimer_.reset();
     }
@@ -705,6 +721,37 @@ protected:
     {
         operation.content = etl::span<const uint8_t>{data, len};
         operation.transferred = 0;
+    }
+
+    // Sequences mid-session actions inside a single run(): the reactor cannot
+    // be re-entered after shutdown() (halt_ never resets), so scenarios that
+    // need "time passes, then act" chain delayed step timers instead of
+    // leaving and re-entering the loop.
+    void ScheduleStep(const int32_t delayMs, const int id)
+    {
+        stepId_ = id;
+        stepTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
+            &TCPConnectionIOCPTest::OnStep>(*this));
+        auto deadline = clock_t::now();
+        deadline += etl::chrono::duration_cast<clock_t::duration>(etl::chrono::milliseconds(delayMs));
+        stepTimer_->arm(deadline);
+        reactor_.addTimer(*stepTimer_);
+    }
+
+    void ArmStopTimer() noexcept
+    {
+        // Stop through a zero-delay timer instead of shutting down in place:
+        // the request may run before reactor.run() even starts (or mid-pass),
+        // and a direct shutdown() would skip the loop pass that drains the
+        // pending dispose operations (terminal callbacks would never fire).
+        if (stopTimer_ && stopTimer_->is_linked()) {
+            return;
+        }
+
+        stopTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
+            &TCPConnectionIOCPTest::OnStop>(*this));
+        stopTimer_->arm(clock_t::now());
+        reactor_.addTimer(*stopTimer_);
     }
 
 protected:
@@ -748,18 +795,7 @@ protected:
             }
         }
 
-        // Stop through a zero-delay timer instead of shutting down in place:
-        // RequestFinish() may run before reactor.run() even starts, and a
-        // direct shutdown() would skip the loop pass that drains the pending
-        // dispose operations (terminal callbacks would never fire).
-        if (stopTimer_ && stopTimer_->is_linked()) {
-            return;
-        }
-
-        stopTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
-            &TCPConnectionIOCPTest::OnStop>(*this));
-        stopTimer_->arm(clock_t::now());
-        reactor_.addTimer(*stopTimer_);
+        ArmStopTimer();
     }
 
     void OnActionTimer() noexcept
@@ -783,11 +819,102 @@ protected:
         reactor_.shutdown();
     }
 
+    // Chained mid-session actions (see ScheduleStep). Each step schedules the
+    // next one, so a single stepTimer_ is pending at any moment.
+    void OnStep() noexcept
+    {
+        switch (stepId_) {
+            case 1: // more peer data while the client is suspended
+                peer(0).Send(stepSecond_, sizeof(stepSecond_));
+                ScheduleStep(150, 2);
+                break;
+            case 2: // snapshot: suppression must have kept the count down
+                midReadyReadCount_ = readyReadCount_;
+                ScheduleStep(150, 3);
+                break;
+            case 3:
+                timerResumeOk_ = driver_->resumeReading().has_value();
+                break;
+
+            case 10: // data first: the probe completes and rearms
+                peer(0).Send(stepFirst_, sizeof(stepFirst_));
+                ScheduleStep(60, 11);
+                break;
+            case 11: // suspend AFTER the rearm — probe pending + quiet socket
+                timerSuspendOk_ = driver_->suspendReading().has_value();
+                ScheduleStep(150, 12);
+                break;
+            case 12:
+                midReadyReadCount_ = readyReadCount_;
+                {
+                    // While suspended the notification path is off, but a
+                    // manual sync read stays legal: the buffer was drained by
+                    // the first delivery, so it must report WOULDBLOCK.
+                    uint8_t probe[8];
+                    const auto got = driver_->read(etl::span<uint8_t>{probe, sizeof(probe)});
+                    readWhileSuspendedErr_ = got ? static_cast<int32_t>(-1) : got.error();
+                }
+                ScheduleStep(150, 13);
+                break;
+            case 13: // second batch: suppression must keep the count down
+                peer(0).Send(stepSecond_, sizeof(stepSecond_));
+                ScheduleStep(150, 14);
+                break;
+            case 14:
+                midSecondReadyReadCount_ = readyReadCount_;
+                timerResumeOk_ = driver_->resumeReading().has_value();
+                break;
+
+            // Suspended data consumed by a manual read, then resume: the probe
+            // must be rearmed (not left as a stale in-flight operation), so a
+            // later batch is delivered again.
+            case 20: // first batch: delivered, the tail rearms the probe
+                peer(0).Send(stepFirst_, sizeof(stepFirst_));
+                ScheduleStep(60, 21);
+                break;
+            case 21: // suspend with the probe pending on a quiet socket
+                timerSuspendOk_ = driver_->suspendReading().has_value();
+                ScheduleStep(150, 22);
+                break;
+            case 22: // second batch while suspended: the probe completion is swallowed
+                peer(0).Send(stepSecond_, sizeof(stepSecond_));
+                ScheduleStep(150, 23);
+                break;
+            case 23: // the manual read drains the second batch from the socket
+                midReadyReadCount_ = readyReadCount_;
+                {
+                    const auto got = driver_->read(etl::span<uint8_t>{readWhileSuspendedBytes_, sizeof(readWhileSuspendedBytes_)});
+                    readWhileSuspendedLen_ = got ? static_cast<int32_t>(got.value()) : -got.error();
+                }
+                ScheduleStep(50, 24);
+                break;
+            case 24: // resume on an empty socket: nothing to deliver yet
+                timerResumeOk_ = driver_->resumeReading().has_value();
+                ScheduleStep(150, 25);
+                break;
+            case 25: // third batch must reach onReadyRead through the rearmed probe
+                midSecondReadyReadCount_ = readyReadCount_;
+                peer(0).Send(stepThird_, sizeof(stepThird_));
+                break;
+
+            default:
+                break;
+        }
+    }
+
     C_Reactor reactor_{};
     std::optional<Driver> driver_;
     std::optional<C_Timer> timeoutTimer_;
     std::optional<C_Timer> actionTimer_;
     std::optional<C_Timer> stopTimer_;
+    std::optional<C_Timer> stepTimer_;
+    int stepId_{0};
+    uint8_t stepFirst_[4]{'A', 'A', 'A', 'A'};
+    uint8_t stepSecond_[4]{'B', 'B', 'B', 'B'};
+    uint8_t stepThird_[4]{'C', 'C', 'C', 'C'};
+    int stepsOnConnectFirst_{10};
+    uint8_t readWhileSuspendedBytes_[8]{};
+    int32_t readWhileSuspendedLen_{0};
 
     etl::pool<Acceptor::accept_operation_t, 4> backlog_{};
     std::optional<Acceptor> acceptor_;
@@ -840,6 +967,11 @@ protected:
     bool consumeReadyRead_{false};
     bool captureReadyReadPayload_{false};
     bool disposeOnPeerCapture_{false};
+    bool stepsOnConnect_{false};
+    bool suspendReadingOnReadyRead_{false};
+    bool suspendOnReadyReadOk_{false};
+    bool timerSuspendOk_{false};
+    bool timerResumeOk_{false};
     bool reconnectOnConnectError_{false};
     bool reconnectOnDisposed_{false};
     bool reconnectOnDisconnect_{false};
@@ -849,6 +981,9 @@ protected:
     int disposeAfterReadyReads_{0};
     int disposeAfterConnects_{0};
     int disposeAfterCommits_{0};
+    int midReadyReadCount_{-1};
+    int midSecondReadyReadCount_{-1};
+    int32_t readWhileSuspendedErr_{0};
     int scheduleDisposeOnConnectMs_{-1};
     char capturedPayload_[64]{};
     int capturedPayloadLen_{0};
@@ -1951,6 +2086,173 @@ TEST_F(TCPConnectionIOCPTest, SendWhileConnectingReturnsNotConn)
     EXPECT_FALSE(timedOut_);
     EXPECT_EQ(commitCount_, 0);
     EXPECT_EQ(disposedCount_, 1);
+}
+
+// ---- connection: suspendReading / resumeReading ---------------------------------
+
+TEST_F(TCPConnectionIOCPTest, SuspendResumeReadingBeforeConnectReturnsNotConn)
+{
+    const auto suspended = driver_->suspendReading();
+    ASSERT_FALSE(suspended.has_value());
+    EXPECT_EQ(suspended.error(), static_cast<int32_t>(WSAENOTCONN));
+
+    const auto resumed = driver_->resumeReading();
+    ASSERT_FALSE(resumed.has_value());
+    EXPECT_EQ(resumed.error(), static_cast<int32_t>(WSAENOTCONN));
+}
+
+TEST_F(TCPConnectionIOCPTest, SuspendResumeReadingGuardCodesWhileConnected)
+{
+    ASSERT_TRUE(StartAcceptor());
+
+    C_Socket fd;
+    ASSERT_TRUE(MakeConnectedSocket(AcceptorPort(), fd));
+    ASSERT_TRUE(driver_->adopt(std::move(fd)).has_value());
+
+    // Resume without a prior suspend: the flag is already up.
+    const auto resumedIdle = driver_->resumeReading();
+    ASSERT_FALSE(resumedIdle.has_value());
+    EXPECT_EQ(resumedIdle.error(), static_cast<int32_t>(WSAEALREADY));
+
+    ASSERT_TRUE(driver_->suspendReading().has_value());
+
+    // Double suspend.
+    const auto suspendedAgain = driver_->suspendReading();
+    ASSERT_FALSE(suspendedAgain.has_value());
+    EXPECT_EQ(suspendedAgain.error(), static_cast<int32_t>(WSAEALREADY));
+
+    // The read probe armed by adopt() is still in flight: resumeReading must
+    // tolerate the double-arm rejection from the reactor and report success
+    // without posting a second probe.
+    ASSERT_TRUE(driver_->resumeReading().has_value());
+
+    // The flag is down again: one more resume is rejected.
+    const auto resumedAgain = driver_->resumeReading();
+    ASSERT_FALSE(resumedAgain.has_value());
+    EXPECT_EQ(resumedAgain.error(), static_cast<int32_t>(WSAEALREADY));
+
+    driver_->dispose();
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_EQ(disposedCount_, 1);
+    // No peer assertions here: the raw socket lives only for a few
+    // microseconds, and the AcceptEx-vs-dispose race decides whether the
+    // acceptor delivers it or reports a failed accept.
+}
+
+// Canonical backpressure pattern: suspend from inside onReadyRead — the probe
+// rearm in the completion tail must be skipped, further peer data must not
+// raise onReadyRead until resumeReading(). The whole timeline is chained
+// through step timers inside a single run().
+TEST_F(TCPConnectionIOCPTest, SuspendReadingFromReadyReadSuppressesDeliveryUntilResume)
+{
+    ASSERT_TRUE(StartAcceptor());
+
+    static constexpr uint8_t kFirst[] = {'A', 'A', 'A', 'A'};
+
+    peer(0).cfg.sendOnAdopt = kFirst;
+    peer(0).cfg.sendOnAdoptLen = sizeof(kFirst);
+    captureReadyReadPayload_ = true;
+    suspendReadingOnReadyRead_ = true;
+    disposeAfterReadyReads_ = 2;
+
+    ASSERT_TRUE(driver_->connect(AcceptorAddress()).has_value());
+
+    // t≈30ms: peer pushes more data while the client is suspended;
+    // t≈180ms: snapshot — no second delivery must have happened;
+    // t≈330ms: resume — the buffered batch is delivered.
+    ScheduleStep(30, 1);
+
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(suspendOnReadyReadOk_);
+    EXPECT_TRUE(timerResumeOk_);
+    // The snapshot proves the suppression: the second batch was already in
+    // the client's buffer at that point, yet no delivery happened.
+    ASSERT_EQ(midReadyReadCount_, 1);
+    ASSERT_EQ(readyReadCount_, 2);
+    ASSERT_EQ(capturedPayloadLen_, 4);
+    EXPECT_EQ(std::memcmp(capturedPayload_, "BBBB", 4), 0);
+    ASSERT_EQ(connectCount_, 1);
+    EXPECT_EQ(disposedCount_, 1);
+    EXPECT_TRUE(peer(0).IsIdle());
+}
+
+// Suspend from outside any callback (a timer step on the loop thread): the
+// first batch is delivered by the already-armed probe, the tail skips the
+// rearm, and the second batch stays undelivered until resumeReading(). A
+// manual sync read remains legal while suspended.
+TEST_F(TCPConnectionIOCPTest, SuspendReadingOutsideCallbackSuppressesDeliveryUntilResume)
+{
+    ASSERT_TRUE(StartAcceptor());
+
+    captureReadyReadPayload_ = true;
+    disposeAfterReadyReads_ = 2;
+    stepsOnConnect_ = true;
+
+    ASSERT_TRUE(driver_->connect(AcceptorAddress()).has_value());
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(timerSuspendOk_);
+    EXPECT_TRUE(timerResumeOk_);
+    ASSERT_EQ(connectCount_, 1);
+    EXPECT_EQ(acceptedCount_, 1);
+    EXPECT_EQ(peer(0).adoptedCount, 1);
+    EXPECT_TRUE(peer(0).sendOk);
+
+    // The first delivery happened before the suspend; the second batch was
+    // suppressed (both mid-run snapshots) and released only by the resume.
+    ASSERT_EQ(midReadyReadCount_, 1);
+    ASSERT_EQ(midSecondReadyReadCount_, 1);
+    ASSERT_EQ(readyReadCount_, 2);
+    ASSERT_EQ(capturedPayloadLen_, 4);
+    EXPECT_EQ(std::memcmp(capturedPayload_, "BBBB", 4), 0);
+    EXPECT_EQ(readWhileSuspendedErr_, static_cast<int32_t>(WSAEWOULDBLOCK));
+    EXPECT_EQ(disposedCount_, 1);
+    EXPECT_EQ(disconnectCount_, 0);
+    EXPECT_TRUE(peer(0).IsIdle());
+}
+
+// Suspend with the probe pending on a quiet socket, peer data arrives (its
+// probe completion is swallowed), a manual read drains it, then resume. The
+// resume finds an empty socket, so silence right after it is correct — but the
+// probe must be armed again: a third batch has to be delivered. A stale
+// in-flight probe would leave the connection deaf and time the test out.
+TEST_F(TCPConnectionIOCPTest, SuspendedDataDrainedByReadThenResumeRearmsProbe)
+{
+    ASSERT_TRUE(StartAcceptor());
+
+    captureReadyReadPayload_ = true;
+    disposeAfterReadyReads_ = 2;
+    stepsOnConnect_ = true;
+    stepsOnConnectFirst_ = 20;
+
+    ASSERT_TRUE(driver_->connect(AcceptorAddress()).has_value());
+    RunReactor();
+
+    EXPECT_FALSE(timedOut_);
+    EXPECT_TRUE(timerSuspendOk_);
+    EXPECT_TRUE(timerResumeOk_);
+    ASSERT_EQ(connectCount_, 1);
+    EXPECT_TRUE(peer(0).sendOk);
+
+    // Second batch: suppressed while suspended, drained by the manual read.
+    ASSERT_EQ(midReadyReadCount_, 1);
+    ASSERT_EQ(readWhileSuspendedLen_, 4);
+    EXPECT_EQ(std::memcmp(readWhileSuspendedBytes_, "BBBB", 4), 0);
+
+    // Resume on an empty socket delivers nothing by itself...
+    ASSERT_EQ(midSecondReadyReadCount_, 1);
+    // ...but the rearmed probe picks up the third batch.
+    ASSERT_EQ(readyReadCount_, 2);
+    ASSERT_EQ(capturedPayloadLen_, 4);
+    EXPECT_EQ(std::memcmp(capturedPayload_, "CCCC", 4), 0);
+    EXPECT_EQ(disposedCount_, 1);
+    EXPECT_EQ(disconnectCount_, 0);
+    EXPECT_TRUE(peer(0).IsIdle());
 }
 
 // ---- acceptor contract ----------------------------------------------------------

@@ -61,13 +61,13 @@ target_sources(etsl_core
         src/tcp/acceptor/iocp/tcp_acceptor_iocp_defs.cppm
         src/tcp/acceptor/iocp/tcp_acceptor_iocp.cppm
         src/timer/timer.cppm
-        src/timer/timer_bucket.cppm
+        src/timer/timer_queue.cppm
         src/timer/timer_impl.cppm
         src/timer/timer_defs.cppm
         src/init/initializer.cppm
     PRIVATE
         src/reactor/iocp/reactor_iocp.cpp
-        src/timer/timer_bucket.cpp
+        src/timer/timer_queue.cpp
         src/util/etl_chrono.cpp
         src/net/net_address.cpp
 )

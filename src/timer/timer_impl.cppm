@@ -3,19 +3,24 @@
 //
 module;
 #include <etl/intrusive_list.h>
+#include <util/noncopyable.h>
 
 export module etsl.timer:impl;
 
-export import :defs;
+import :defs;
 
-export namespace etsl
+namespace etsl
 {
-    class C_Timer : public etl::bidirectional_link<0>
+    struct timer_node_s : etl::bidirectional_link<0> {};
+
+    export class C_Timer : private timer_node_s
     {
     public:
-        ~C_Timer() noexcept = default;
+        ~C_Timer() noexcept { assert(!is_linked() && "UAF error caught!"); }
 
         explicit C_Timer(const timer_callback_t& callback) noexcept : callback_(callback) {}
+
+        ETSL_NON_COPYABLE_NON_MOVABLE(C_Timer);
 
         void execute() const noexcept
         {
@@ -23,14 +28,13 @@ export namespace etsl
             this->callback_();
         }
 
-        void arm(const time_point_t& absoluteDeadline) noexcept
-        {
-            this->deadline_ = absoluteDeadline;
-        }
+        [[nodiscard]] bool isArmed() const noexcept { return is_linked(); }
 
         [[nodiscard]] const time_point_t& deadline() const noexcept { return this->deadline_; }
 
     private:
+        friend class C_TimerQueue;
+
         time_point_t deadline_;
         timer_callback_t callback_;
     };
