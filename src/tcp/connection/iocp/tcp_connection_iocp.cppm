@@ -296,7 +296,7 @@ export namespace etsl
         }
 
         if (const auto err = C_Reactor::Assign(this->readinessOperation_,
-            [&fd, &addr](C_Reactor::operation_t& operation) -> etl::expected<void, int32_t> {
+            [&fd, &addr](C_Reactor::operation_t& operation) noexcept -> etl::expected<void, int32_t> {
                 return ConnectEx(fd.get(), addr, operation);
             }
         ); !err) {
@@ -318,7 +318,7 @@ export namespace etsl
         }
 
         if (const auto err = C_Reactor::Assign(this->readinessOperation_,
-            [this](C_Reactor::operation_t& operation) -> etl::expected<void, int32_t> {
+            [this](C_Reactor::operation_t& operation) noexcept -> etl::expected<void, int32_t> {
                 DWORD flags = 0;
                 WSABUF tmp{};
 
@@ -346,7 +346,7 @@ export namespace etsl
         }
 
         if (const auto err = C_Reactor::Assign(operation,
-            [this](send_operation_t& operation) -> etl::expected<void, int32_t> {
+            [this](send_operation_t& operation) noexcept -> etl::expected<void, int32_t> {
                 WSABUF buffer = {
                     .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
                     .buf = reinterpret_cast<char*>(const_cast<uint8_t*>(operation.content.data() + operation.transferred)),
@@ -441,7 +441,7 @@ export namespace etsl
         uint32_t /*transferred*/, int32_t error) noexcept
     {
         --this->pendingOps_;
-        if (error = C_Reactor::TranslateError(this->fd_, this->readinessOperation_, error); error != ERROR_SUCCESS) {
+        if (error != ERROR_SUCCESS) {
             beginTeardown(error);
             return;
         }
@@ -464,7 +464,7 @@ export namespace etsl
         };
 
         --this->pendingOps_;
-        if (error = C_Reactor::TranslateError(this->fd_, operation, error); error != ERROR_SUCCESS) {
+        if (error != ERROR_SUCCESS) {
             finalize(error);
             return;
         }

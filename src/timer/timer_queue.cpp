@@ -3,7 +3,6 @@
 //
 module;
 #include <cassert>
-#include <cstdint>
 
 #include <etl/algorithm.h>
 #include <etl/chrono.h>
@@ -23,7 +22,7 @@ namespace etsl
 
         timer.deadline_ = steady_clock_t::now() + duration;
         auto it = get_tail();
-        while (it != &this->terminal_link && timer.deadline_ < static_cast<C_Timer*>(it)->deadline_) {
+        while (it != &this->terminal_link && timer.deadline_ < reinterpret_cast<C_Timer*>(it)->deadline_) {
             it = it->etl_previous;
         }
 
@@ -46,16 +45,16 @@ namespace etsl
             return nullptr;
         }
 
-        return &static_cast<const C_Timer*>(get_head())->deadline_;
+        return &reinterpret_cast<const C_Timer*>(get_head())->deadline_;
     }
 
-    const C_Timer* C_TimerQueue::pop(const time_point_t& now) noexcept
+    C_Timer* C_TimerQueue::pop(const time_point_t& now) noexcept
     {
         if (empty()) {
             return nullptr;
         }
 
-        const auto first = static_cast<C_Timer*>(get_head());
+        const auto first = reinterpret_cast<C_Timer*>(get_head());
         if (first->deadline_ > now) {
             return nullptr;
         }

@@ -32,7 +32,6 @@ namespace etsl
         SHUTDOWN = 0,
         TASK,
         IO,
-        ADD_TIMER,
     };
 
     static_assert(std::is_base_of_v<WSAOVERLAPPED, operation_iocp_s>,

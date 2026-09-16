@@ -92,7 +92,7 @@ private:
     etl::pool<accept_operation_t, 1> backlog{};
 };
 
-void timer_callback()
+void timer_callback(etsl::C_Timer& timer) noexcept
 {
     return;
 }
@@ -108,7 +108,7 @@ int main()
         return err.error();
     }
 
-    etsl::timer_callback_t timerCallback(timer_callback);
+    etsl::C_Timer::callback_t timerCallback(timer_callback);
     etsl::C_Timer timer(timerCallback); etsl::C_Timer timer2(timerCallback);
     reactor.schedule(timer, etsl::timer_duration_t(1000));
     reactor.schedule(timer2, etsl::timer_duration_t(3000));

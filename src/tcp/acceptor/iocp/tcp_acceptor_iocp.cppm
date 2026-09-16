@@ -54,7 +54,7 @@ export namespace etsl
 
         void beginTeardown(int32_t reason) noexcept;
 
-        [[nodiscard]] etl::expected<void, int32_t> acceptIncoming(accept_operation_t& operation, int32_t lastError) noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> acceptIncoming(accept_operation_t& operation, int32_t error) noexcept;
 
         void onIncoming(C_Reactor::operation_t& operation, uint32_t /*transferred*/, int32_t error) noexcept;
 
@@ -213,7 +213,7 @@ export namespace etsl
         }
 
         if (const auto err = C_Reactor::Assign(operation,
-            [this](accept_operation_t& operation) -> etl::expected<void, int32_t> {
+            [this](accept_operation_t& operation) noexcept -> etl::expected<void, int32_t> {
                 if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
                     return err;
                 }
@@ -283,14 +283,14 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::acceptIncoming(accept_operation_t& operation, int32_t lastError) noexcept
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::acceptIncoming(accept_operation_t& operation, int32_t error) noexcept
     {
         if (this->state_ != tcp_acceptor_state_e::LISTENING) {
             return etl::unexpected(static_cast<int32_t>(WSA_OPERATION_ABORTED));
         }
 
-        if (lastError != ERROR_SUCCESS) {
-            return etl::unexpected(C_Reactor::TranslateError(this->gateway_, operation, lastError));
+        if (error != ERROR_SUCCESS) {
+            return etl::unexpected(error);
         }
 
         socket_t listening = this->gateway_.get();

@@ -263,7 +263,6 @@ private:
 class TCPConnectionIOCPTest : public ::testing::Test
 {
 public:
-    using clock_t = etsl::steady_clock_t;
     using timer_callback_t = etsl::timer_callback_t;
     using C_Address = etsl::C_Address;
     using C_Reactor = etsl::C_Reactor;
@@ -658,16 +657,17 @@ protected:
 
     void TearDown() override
     {
-        if (actionTimer_ && actionTimer_->is_linked()) {
+        // unschedule() is a no-op on an unarmed timer, so no isArmed() checks.
+        if (actionTimer_) {
             reactor_.unschedule(*actionTimer_);
         }
-        if (timeoutTimer_ && timeoutTimer_->is_linked()) {
+        if (timeoutTimer_) {
             reactor_.unschedule(*timeoutTimer_);
         }
-        if (stopTimer_ && stopTimer_->is_linked()) {
+        if (stopTimer_) {
             reactor_.unschedule(*stopTimer_);
         }
-        if (stepTimer_ && stepTimer_->is_linked()) {
+        if (stepTimer_) {
             reactor_.unschedule(*stepTimer_);
         }
         actionTimer_.reset();
@@ -692,17 +692,12 @@ protected:
         timedOut_ = false;
         timeoutTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
             &TCPConnectionIOCPTest::OnTimeout>(*this));
-
-        auto deadline = clock_t::now();
-        deadline += etl::chrono::duration_cast<clock_t::duration>(etl::chrono::milliseconds(timeoutMs));
-        timeoutTimer_->arm(deadline);
-        reactor_.addTimer(*timeoutTimer_);
+        reactor_.schedule(*timeoutTimer_, etl::chrono::milliseconds(timeoutMs));
 
         reactor_.run();
 
-        if (timeoutTimer_ && timeoutTimer_->is_linked()) {
-            reactor_.unschedule(*timeoutTimer_);
-        }
+        // The reactor may have stopped with the timeout timer still armed.
+        reactor_.unschedule(*timeoutTimer_);
         timeoutTimer_.reset();
     }
 
@@ -710,10 +705,7 @@ protected:
     {
         actionTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
             &TCPConnectionIOCPTest::OnActionTimer>(*this));
-        auto deadline = clock_t::now();
-        deadline += etl::chrono::duration_cast<clock_t::duration>(etl::chrono::milliseconds(delayMs));
-        actionTimer_->arm(deadline);
-        reactor_.addTimer(*actionTimer_);
+        reactor_.schedule(*actionTimer_, etl::chrono::milliseconds(delayMs));
         actionDispose_ = true;
     }
 
@@ -732,10 +724,7 @@ protected:
         stepId_ = id;
         stepTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
             &TCPConnectionIOCPTest::OnStep>(*this));
-        auto deadline = clock_t::now();
-        deadline += etl::chrono::duration_cast<clock_t::duration>(etl::chrono::milliseconds(delayMs));
-        stepTimer_->arm(deadline);
-        reactor_.addTimer(*stepTimer_);
+        reactor_.schedule(*stepTimer_, etl::chrono::milliseconds(delayMs));
     }
 
     void ArmStopTimer() noexcept
@@ -744,14 +733,13 @@ protected:
         // the request may run before reactor.run() even starts (or mid-pass),
         // and a direct shutdown() would skip the loop pass that drains the
         // pending dispose operations (terminal callbacks would never fire).
-        if (stopTimer_ && stopTimer_->is_linked()) {
+        if (stopTimer_ && stopTimer_->isArmed()) {
             return;
         }
 
         stopTimer_.emplace(timer_callback_t::create<TCPConnectionIOCPTest,
             &TCPConnectionIOCPTest::OnStop>(*this));
-        stopTimer_->arm(clock_t::now());
-        reactor_.addTimer(*stopTimer_);
+        reactor_.schedule(*stopTimer_, etl::chrono::milliseconds(0));
     }
 
 protected:

@@ -4,6 +4,7 @@
 module;
 #include <winsock2.h>
 #include <windows.h>
+#include <ntdef.h>
 
 #include <etl/chrono.h>
 #include "etl/expected.h"
@@ -19,20 +20,6 @@ namespace etsl
         if (this->iocp_ != nullptr) {
             CloseHandle(this->iocp_);
         }
-    }
-
-    int32_t C_ReactorIOCP::TranslateError(const C_Socket& fd, const operation_t& operation, int32_t iocpError) noexcept
-    {
-        if (iocpError == ERROR_SUCCESS) {
-            return iocpError;
-        }
-
-        DWORD flags = 0, transferred = 0;
-        if (WSAGetOverlappedResult(fd.get(), const_cast<LPOVERLAPPED>(static_cast<const WSAOVERLAPPED*>(&operation)), &transferred, false, &flags)) {
-            return iocpError; // Расхождение с реактором, но остаёмся пессимистами.
-        }
-
-        return WSAGetLastError();
     }
 
     etl::expected<void, int32_t> C_ReactorIOCP::initialize() noexcept
@@ -51,8 +38,7 @@ namespace etsl
 
     etl::expected<void, int32_t> C_ReactorIOCP::associate(const socket_t fd) noexcept
     {
-        if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(fd), this->iocp_,
-            static_cast<ULONG_PTR>(iocp_code_e::IO), 0)) {
+        if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(fd), this->iocp_, fd, 0)) {
             return etl::unexpected(static_cast<int32_t>(GetLastError()));
         }
 
@@ -66,8 +52,16 @@ namespace etsl
 
     etl::expected<void, int32_t> C_ReactorIOCP::post(operation_t& task) noexcept
     {
-        if (!PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::TASK), &task)) {
-            return etl::unexpected(static_cast<int32_t>(GetLastError()));
+        if (const auto err = Assign(task,
+            [this](operation_t& operation) noexcept -> etl::expected<void, int32_t> {
+                if (!PostQueuedCompletionStatus(this->iocp_, 0, 0, &operation)) {
+                    return etl::unexpected(static_cast<int32_t>(GetLastError()));
+                }
+
+                return {};
+            }
+        ); !err) {
+            return err;
         }
 
         return {};
@@ -91,10 +85,14 @@ namespace etsl
             WSAOVERLAPPED* overlapped = nullptr;
 
             const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, nextTimeout());
-            const auto ioError = (ioStatus) ? 0 : static_cast<int32_t>(GetLastError());
+            auto ioError = (ioStatus) ? 0 : static_cast<int32_t>(GetLastError());
 
             if (overlapped) {
                 const auto operation = reinterpret_cast<operation_t*>(overlapped);
+                if (completionKey && !NT_SUCCESS(operation->Internal)) {
+                    ioError = TranslateError(completionKey, operation);
+                }
+
                 operation->inFlight = false;
                 operation->callback(*operation, bytesTransferred, ioError);
             }
@@ -113,7 +111,25 @@ namespace etsl
     void C_ReactorIOCP::shutdown() noexcept
     {
         this->halt_ = true;
-        PostQueuedCompletionStatus(this->iocp_, 0, static_cast<ULONG_PTR>(iocp_code_e::SHUTDOWN), nullptr);
+        PostQueuedCompletionStatus(this->iocp_, 0, 0, nullptr);
+    }
+
+    int32_t C_ReactorIOCP::TranslateError(const socket_t fd, WSAOVERLAPPED* operation) noexcept
+    {
+        DWORD flags = 0, transferred = 0;
+        if (WSAGetOverlappedResult(fd, operation, &transferred, false, &flags)) {
+            return ERROR_SUCCESS;
+        }
+
+        if (const auto err = WSAGetLastError(); err != WSAENOTSOCK) {
+            return err;
+        }
+
+        if (!GetOverlappedResult(reinterpret_cast<HANDLE>(fd), operation, &transferred, false)) {
+            return static_cast<int32_t>(GetLastError());
+        }
+
+        return ERROR_SUCCESS;
     }
 
     uint32_t C_ReactorIOCP::nextTimeout() const noexcept

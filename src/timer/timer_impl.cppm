@@ -2,6 +2,7 @@
 // Created by sexey on 20.07.2026.
 //
 module;
+#include <etl/delegate.h>
 #include <etl/intrusive_list.h>
 #include <util/noncopyable.h>
 
@@ -16,16 +17,18 @@ namespace etsl
     export class C_Timer : private timer_node_s
     {
     public:
+        using callback_t = etl::delegate<void(C_Timer&)>;
+
         ~C_Timer() noexcept { assert(!is_linked() && "UAF error caught!"); }
 
-        explicit C_Timer(const timer_callback_t& callback) noexcept : callback_(callback) {}
+        explicit C_Timer(const callback_t& callback) noexcept : callback_(callback) {}
 
         ETSL_NON_COPYABLE_NON_MOVABLE(C_Timer);
 
-        void execute() const noexcept
+        void execute() noexcept
         {
             assert(this->callback_ && "Timer callback should not be a null!");
-            this->callback_();
+            this->callback_(*this);
         }
 
         [[nodiscard]] bool isArmed() const noexcept { return is_linked(); }
@@ -36,6 +39,6 @@ namespace etsl
         friend class C_TimerQueue;
 
         time_point_t deadline_;
-        timer_callback_t callback_;
+        callback_t callback_;
     };
 }

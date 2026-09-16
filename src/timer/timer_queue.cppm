@@ -22,6 +22,6 @@ export namespace etsl
 
         [[nodiscard]] const time_point_t* nearest() const noexcept;
 
-        [[nodiscard]] const C_Timer* pop(const time_point_t& now) noexcept;
+        [[nodiscard]] C_Timer* pop(const time_point_t& now) noexcept;
     };
 }
