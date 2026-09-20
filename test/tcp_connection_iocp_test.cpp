@@ -263,7 +263,7 @@ private:
 class TCPConnectionIOCPTest : public ::testing::Test
 {
 public:
-    using timer_callback_t = etsl::timer_callback_t;
+    using timer_callback_t = etsl::C_Timer::callback_t;
     using C_Address = etsl::C_Address;
     using C_Reactor = etsl::C_Reactor;
     using C_Timer = etsl::C_Timer;
@@ -694,7 +694,12 @@ protected:
             &TCPConnectionIOCPTest::OnTimeout>(*this));
         reactor_.schedule(*timeoutTimer_, etl::chrono::milliseconds(timeoutMs));
 
-        reactor_.run();
+        const auto runResult = reactor_.run();
+        // The loop only comes back with an error on a critical reactor
+        // failure; the graceful exits (OnStop / OnTimeout) shut it down
+        // themselves and still yield a success value.
+        ASSERT_TRUE(runResult.has_value())
+            << "reactor.run() terminated on a critical error: " << runResult.error();
 
         // The reactor may have stopped with the timeout timer still armed.
         reactor_.unschedule(*timeoutTimer_);
@@ -786,7 +791,7 @@ protected:
         ArmStopTimer();
     }
 
-    void OnActionTimer() noexcept
+    void OnActionTimer(C_Timer& /*timer*/) noexcept
     {
         if (actionDispose_) {
             actionDispose_ = false;
@@ -794,22 +799,24 @@ protected:
         }
     }
 
-    void OnTimeout() noexcept
+    void OnTimeout(C_Timer& /*timer*/) noexcept
     {
         timedOut_ = true;
         finished_ = true;
-        reactor_.shutdown();
+        // A failed wakeup cannot be reported from here: with no events left
+        // the loop would hang before the test body could observe the flag.
+        static_cast<void>(reactor_.shutdown());
     }
 
-    void OnStop() noexcept
+    void OnStop(C_Timer& /*timer*/) noexcept
     {
         finished_ = true;
-        reactor_.shutdown();
+        static_cast<void>(reactor_.shutdown());
     }
 
     // Chained mid-session actions (see ScheduleStep). Each step schedules the
     // next one, so a single stepTimer_ is pending at any moment.
-    void OnStep() noexcept
+    void OnStep(C_Timer& /*timer*/) noexcept
     {
         switch (stepId_) {
             case 1: // more peer data while the client is suspended

@@ -137,6 +137,9 @@ int main()
         return err.error();
     }*/
 
-    reactor.run();
+    if (const auto err = reactor.run(); !err) {
+        return err.error();
+    }
+
     return 0;
 }

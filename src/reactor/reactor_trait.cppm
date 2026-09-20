@@ -18,9 +18,9 @@ export namespace etsl
     {
         { t.initialize() } noexcept -> std::same_as<etl::expected<void, int32_t>>;
 
-        { t.run() } noexcept -> std::same_as<void>;
+        { t.run() } noexcept -> std::same_as<etl::expected<void, int32_t>>;
 
-        { t.shutdown() } noexcept -> std::same_as<void>;
+        { t.shutdown() } noexcept -> std::same_as<etl::expected<void, int32_t>>;
 
         { t.associate(fd) } noexcept -> std::same_as<etl::expected<void, int32_t>>;
 

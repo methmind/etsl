@@ -46,7 +46,7 @@ export namespace etsl
         [[nodiscard]] static etl::expected<C_Address, int32_t> GetRemotePeerAddr(socket_t fd, void* acceptBuffer) noexcept;
 
         [[nodiscard]] static etl::expected<void, int32_t> AcceptEx(socket_t gateway,
-            accept_operation_t& operation) noexcept;
+            accept_operation_t& operation, WSAOVERLAPPED* overlapped) noexcept;
 
         [[nodiscard]] etl::expected<void, int32_t> rearmAcceptOperation(accept_operation_t& operation) noexcept;
 
@@ -79,7 +79,7 @@ export namespace etsl
     {
         static_assert(TCPAcceptorDelegate<delegate_t>, "Delegate must satisfy tcp acceptor delegate trait!");
 
-        this->disposeOperation_.callback = decltype(this->disposeOperation_.callback)::template create<
+        this->disposeOperation_.delegate = decltype(this->disposeOperation_.delegate)::template create<
             C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onDisposeOperation>(*this);
     }
 
@@ -175,7 +175,8 @@ export namespace etsl
     }
 
     template<typename delegate_t>
-    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::AcceptEx(socket_t gateway, accept_operation_t& operation) noexcept
+    etl::expected<void, int32_t> C_TCPAcceptorIOCP<delegate_t>::AcceptEx(socket_t gateway, accept_operation_t& operation,
+        WSAOVERLAPPED* overlapped) noexcept
     {
         auto getResult = GetExtensionFunction<WSAID_ACCEPTEX>(gateway);
         if (!getResult) {
@@ -185,7 +186,7 @@ export namespace etsl
         DWORD tmp = 0;
         const auto acceptEx = reinterpret_cast<LPFN_ACCEPTEX>(*getResult);
         if (!acceptEx(gateway, operation.fd.get(), static_cast<void*>(&operation.buffer), 0,
-            ACCEPT_BUFFER_SIZE, ACCEPT_BUFFER_SIZE, &tmp, static_cast<WSAOVERLAPPED*>(&operation))) {
+            ACCEPT_BUFFER_SIZE, ACCEPT_BUFFER_SIZE, &tmp, overlapped)) {
             if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
                 return etl::unexpected(err);
             }
@@ -207,18 +208,9 @@ export namespace etsl
         }
 
         operation.fd = etl::move(*newDescriptor);
-        if (!operation.callback.is_valid()) {
-            operation.callback = decltype(accept_operation_t::callback)::create<
-               C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this);
-        }
-
-        if (const auto err = C_Reactor::Assign(operation,
-            [this](accept_operation_t& operation) noexcept -> etl::expected<void, int32_t> {
-                if (const auto err = AcceptEx(this->gateway_.get(), operation); !err) {
-                    return err;
-                }
-
-                return {};
+        if (const auto err = operation.assign(
+            [this, &operation](WSAOVERLAPPED* overlapped) noexcept -> etl::expected<void, int32_t> {
+                return AcceptEx(this->gateway_.get(), operation, overlapped);
             }
         ); !err) {
             return err;
@@ -244,6 +236,9 @@ export namespace etsl
             if (!operation) {
                 continue;
             }
+
+            operation->setDelegate(C_Reactor::operation_t::delegate_t::create<
+                C_TCPAcceptorIOCP, &C_TCPAcceptorIOCP::onIncoming>(*this));
 
             if (lastError = rearmAcceptOperation(*operation); !lastError) {
                 continue;

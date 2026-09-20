@@ -4,6 +4,7 @@
 module;
 #include <winsock2.h>
 #include <windows.h>
+#include <etl/atomic.h>
 #include <etl/expected.h>
 #include <etl/intrusive_list.h>
 
@@ -19,7 +20,7 @@ export namespace etsl
     class C_ReactorIOCP
     {
     public:
-        using operation_t = operation_iocp_s;
+        using operation_t = C_OperationIOCP;
         using dispose_operation_t = dispose_operation_iocp_s;
 
         ~C_ReactorIOCP() noexcept;
@@ -29,9 +30,6 @@ export namespace etsl
 
         [[nodiscard]] etl::expected<void, int32_t> associate(socket_t fd) noexcept;
 
-        template<typename op_t, typename post_t> requires std::derived_from<op_t, operation_t> && std::same_as<std::invoke_result_t<post_t&, op_t&>, etl::expected<void, int32_t>>
-        [[nodiscard]] static etl::expected<void, int32_t> Assign(op_t& operation, post_t&& post) noexcept;
-
         void detach(dispose_operation_t& operation) noexcept;
 
         [[nodiscard]] etl::expected<void, int32_t> post(operation_t& task) noexcept;
@@ -40,9 +38,9 @@ export namespace etsl
 
         void unschedule(C_Timer& timer) noexcept;
 
-        void run() noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> run() noexcept;
 
-        void shutdown() noexcept;
+        [[nodiscard]] etl::expected<void, int32_t> shutdown() noexcept;
 
     private:
         [[nodiscard]] static int32_t TranslateError(socket_t fd, WSAOVERLAPPED* operation) noexcept;
@@ -51,26 +49,12 @@ export namespace etsl
 
         [[nodiscard]] const dispose_operation_t* popDisposable() noexcept;
 
-        bool halt_;
+        [[nodiscard]] static etl::expected<void, int32_t> ProceedOperations(HANDLE iocp, uint32_t timeout) noexcept;
+
+        etl::atomic<bool> halt_;
         HANDLE iocp_;
 
         C_TimerQueue timerQueue_;
         etl::intrusive_list<dispose_operation_t, etl::bidirectional_link<0>> disposable_;
     };
-
-    template<typename op_t, typename post_t> requires std::derived_from<op_t, C_ReactorIOCP::operation_t> && std::same_as<std::invoke_result_t<post_t&, op_t&>, etl::expected<void, int32_t>>
-    etl::expected<void, int32_t> C_ReactorIOCP::Assign(op_t& operation, post_t&& post) noexcept
-    {
-        if (operation.inFlight) {
-            return etl::unexpected(WSAEALREADY);
-        }
-
-        memset(static_cast<WSAOVERLAPPED*>(&operation), 0, sizeof(WSAOVERLAPPED));
-        if (const auto err = post(operation); !err) {
-            return err;
-        }
-
-        operation.inFlight = true;
-        return {};
-    }
 }

@@ -54,7 +54,7 @@ export namespace etsl
         [[nodiscard]] static etl::expected<void, int32_t> EphemeralBind(socket_t fd) noexcept;
 
         [[nodiscard]] static etl::expected<void, int32_t> ConnectEx(socket_t fd, const C_Address& addr,
-            WSAOVERLAPPED& completion) noexcept;
+            WSAOVERLAPPED* operation) noexcept;
 
         [[nodiscard]] etl::expected<void, int32_t> createConnectOperation(const C_Address& addr, C_Socket&& fd) noexcept;
 
@@ -77,7 +77,7 @@ export namespace etsl
         void onDisposeOperation() noexcept;
 
         C_Reactor& reactor_;
-        C_Reactor::operation_t readinessOperation_{};
+        C_Reactor::operation_t readinessOperation_;
         C_Reactor::dispose_operation_t disposeOperation_{};
 
         C_Socket fd_;
@@ -93,16 +93,15 @@ export namespace etsl
 
     template<typename delegate_t>
     C_TCPConnectionIOCP<delegate_t>::C_TCPConnectionIOCP(C_Reactor& reactor, delegate_t& delegate) noexcept :
-        reactor_(reactor), fd_(INVALID_SOCKET), state_(tcp_connection_state_e::NONE), pendingOps_(0),
+        reactor_(reactor), readinessOperation_(C_Reactor::operation_t::delegate_t::create<
+            C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onReadinessOperation
+        >(*this)),
+        fd_(INVALID_SOCKET), state_(tcp_connection_state_e::NONE), pendingOps_(0),
         wasConnected_(false), suspendReading_(false), cachedDisposeReason_(INVALID_CACHE_VALUE), delegate_(delegate)
     {
         static_assert(TCPConnectionDelegate<delegate_t>, "Delegate must satisfy tcp connection delegate trait!");
 
-        this->readinessOperation_.callback = decltype(C_Reactor::operation_t::callback)::create<
-            C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onReadinessOperation
-        >(*this);
-
-        this->disposeOperation_.callback = decltype(C_Reactor::dispose_operation_t::callback)::create<
+        this->disposeOperation_.delegate = decltype(C_Reactor::dispose_operation_t::delegate)::create<
             C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onDisposeOperation
         >(*this);
     }
@@ -165,15 +164,19 @@ export namespace etsl
             return etl::unexpected(WSAENOTCONN);
         }
 
+        if (operation.inFlight()) {
+            return etl::unexpected(WSAEALREADY);
+        }
+
         if (content.empty()) {
             return etl::unexpected(WSAEINVAL);
         }
 
         operation.transferred = 0;
         operation.content = content;
-        operation.callback = decltype(operation.callback)::create<
+        operation.setDelegate(send_operation_t::delegate_t::create<
             C_TCPConnectionIOCP, &C_TCPConnectionIOCP::onSendOperation
-        >(*this);
+        >(*this));
 
         if (const auto err = createSendOperation(operation); !err) {
             beginTeardown(err.error());
@@ -267,7 +270,7 @@ export namespace etsl
 
     template<typename delegate_t>
     etl::expected<void, int32_t> C_TCPConnectionIOCP<delegate_t>::ConnectEx(socket_t fd, const C_Address& addr,
-        WSAOVERLAPPED& completion) noexcept
+        WSAOVERLAPPED* operation) noexcept
     {
         auto getResult = GetExtensionFunction<WSAID_CONNECTEX>(fd);
         if (!getResult) {
@@ -275,7 +278,7 @@ export namespace etsl
         }
 
         const auto connectEx = reinterpret_cast<LPFN_CONNECTEX>(*getResult);
-        if (!connectEx(fd, &addr.data(), static_cast<int32_t>(addr.size()), nullptr, 0, nullptr, &completion)) {
+        if (!connectEx(fd, &addr.data(), static_cast<int32_t>(addr.size()), nullptr, 0, nullptr, operation)) {
             if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
                 return etl::unexpected(err);
             }
@@ -295,9 +298,9 @@ export namespace etsl
             return err;
         }
 
-        if (const auto err = C_Reactor::Assign(this->readinessOperation_,
-            [&fd, &addr](C_Reactor::operation_t& operation) noexcept -> etl::expected<void, int32_t> {
-                return ConnectEx(fd.get(), addr, operation);
+        if (const auto err = this->readinessOperation_.assign(
+            [&fd, &addr](WSAOVERLAPPED* overlapped) noexcept -> etl::expected<void, int32_t> {
+                return ConnectEx(fd.get(), addr, overlapped);
             }
         ); !err) {
             return err;
@@ -317,20 +320,17 @@ export namespace etsl
             return etl::unexpected(WSAENOTCONN);
         }
 
-        if (const auto err = C_Reactor::Assign(this->readinessOperation_,
-            [this](C_Reactor::operation_t& operation) noexcept -> etl::expected<void, int32_t> {
-                DWORD flags = 0;
-                WSABUF tmp{};
-
-                if (WSARecv(this->fd_.get(), &tmp, 1, nullptr, &flags, &operation, nullptr) == SOCKET_ERROR) {
-                    if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
-                        return etl::unexpected(err);
-                    }
+        if (const auto err = this->readinessOperation_.assign([this](WSAOVERLAPPED* overlapped) noexcept -> etl::expected<void, int32_t> {
+            DWORD flags = 0;
+            WSABUF tmp{};
+            if (WSARecv(this->fd_.get(), &tmp, 1, nullptr, &flags, overlapped, nullptr) == SOCKET_ERROR) {
+                if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
+                    return etl::unexpected(err);
                 }
-
-                return {};
             }
-        ); !err) {
+
+            return {};
+        }); !err) {
             return err;
         }
 
@@ -345,22 +345,20 @@ export namespace etsl
             return etl::unexpected(WSAENOTCONN);
         }
 
-        if (const auto err = C_Reactor::Assign(operation,
-            [this](send_operation_t& operation) noexcept -> etl::expected<void, int32_t> {
-                WSABUF buffer = {
-                    .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
-                    .buf = reinterpret_cast<char*>(const_cast<uint8_t*>(operation.content.data() + operation.transferred)),
-                };
+        WSABUF buffer = {
+            .len = static_cast<uint32_t>(operation.content.size() - operation.transferred),
+            .buf = reinterpret_cast<char*>(const_cast<uint8_t*>(operation.content.data() + operation.transferred)),
+        };
 
-                if (WSASend(this->fd_.get(), &buffer, 1, nullptr, 0, &operation, nullptr) == SOCKET_ERROR) {
-                    if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
-                        return etl::unexpected(err);
-                    }
+        if (const auto err = operation.assign([this, &buffer](WSAOVERLAPPED* overlapped) noexcept -> etl::expected<void, int32_t> {
+            if (WSASend(this->fd_.get(), &buffer, 1, nullptr, 0, overlapped, nullptr) == SOCKET_ERROR) {
+                if (const auto err = WSAGetLastError(); err != WSA_IO_PENDING) {
+                    return etl::unexpected(err);
                 }
-
-                return {};
             }
-        ); !err) {
+
+            return {};
+        }); !err) {
             return err;
         }
 
@@ -413,7 +411,7 @@ export namespace etsl
         }
 
         this->delegate_.onReadyRead();
-        if (this->suspendReading_ || this->readinessOperation_.inFlight) {
+        if (this->suspendReading_ || this->readinessOperation_.inFlight()) {
             return {};
         }
 

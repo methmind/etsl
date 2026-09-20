@@ -99,7 +99,10 @@
   пауза из `onReadyRead`, suspend из таймера, resume при пробе в полёте) —
   **48/48 ×3**, см. 3.3. 14.09.2026 (ночь):
   +`SuspendedDataDrainedByReadThenResumeRearmsProbe` (проверка «кандидата в
-  дефекты» из прогонов 3.3 — не подтвердился) — **49/49 ×3**.)*
+  дефекты» из прогонов 3.3 — не подтвердился) — **49/49 ×3**. 18.09.2026:
+  после переноса цикла на `GetQueuedCompletionStatusEx` и инкапсуляции операции
+  (`C_OperationIOCP`) — **49/49** (Debug, MinGW, ВМ, 5,7 с); состав набора не
+  менялся, правки только под новые сигнатуры и колбэк таймера.)*
 - Тестовый exe на ВМ deploy-хуком **не** обновляется (хук есть только у
   `etsl`) — перед прогоном заливать свежую сборку (команды ниже), иначе
   запускается устаревший бинарь.
@@ -214,10 +217,15 @@ platform connection в `reactor` или `socket` запрещено.
 ### ADR-3. Диспетчеризация — `etl::delegate` + делегат соединения
 
 ```cpp
-// Реактор не знает тип операции. Подача — только C_Reactor::Assign (ADR-11).
-struct operation_iocp_s : WSAOVERLAPPED {
-    etl::delegate<void(operation_iocp_s& operation, uint32_t bytes, int32_t error)> callback;
-    bool inFlight; // ставит Assign, снимает run() до callback; последним — ADR-11
+// Реактор не знает тип операции. Подача — только operation.assign(post) (ADR-11).
+class C_OperationIOCP : private WSAOVERLAPPED {
+public:
+    using delegate_t = etl::delegate<void(C_OperationIOCP& operation, uint32_t bytes, int32_t error)>;
+    // assign(post): flush → post(WSAOVERLAPPED*) → inFlight_ = true
+private:
+    friend class C_ReactorIOCP;  // complete(bytes, error): снять флаг → делегат
+    delegate_t delegate_;
+    bool inFlight_;              // последним — ADR-11
 };
 ```
 
@@ -263,11 +271,13 @@ IOCP reactor доставляет raw completion делегату операци
   затем `onDisposed(err)` (критичное опустение пула) — два разных события,
   а не дублирование.
 
-*Пересмотрено 13.09.2026:* прежняя запись («валидный callback одновременно
-обозначает in-flight operation; reactor очищает его перед вызовом, отдельного
-`pending` flag нет») с кодом разошлась — реактор callback не очищает, акцептор
-по `is_valid()` лишь лениво создаёт делегат. Состояние «в полёте» — явный флаг
-`inFlight`, подача — `C_Reactor::Assign` (ADR-11). Виртуальных иерархий и heap
+*Пересмотрено 13.09.2026, уточнено 18.09.2026:* прежняя запись («валидный
+callback одновременно обозначает in-flight operation; reactor очищает его перед
+вызовом, отдельного `pending` flag нет») с кодом разошлась. Состояние «в полёте»
+— приватный флаг `inFlight_`, подача — `C_OperationIOCP::assign(post)` (ADR-11).
+Делегат выставляется явно (`setDelegate()`; акцептор делает это при создании
+слота в `armAcceptBacklog`, ленивой проверки `is_valid()` в перевзводе больше
+нет), а `assign()` без делегата отдаёт `WSAEINVAL`. Виртуальных иерархий и heap
 type-erasure нет.
 
 ### ADR-4. Владение памятью — библиотека не аллоцирует
@@ -279,8 +289,9 @@ type-erasure нет.
   хранит указатель только до completion.
 - Write payload и `send_operation_t` принадлежат пользователю и живут до
   единственного терминального `onCommit`; переиспользование или разрушение
-  контекста до завершения запрещено (реактор пишет в его `WSAOVERLAPPED` через
-  `Assign`, ADR-11; повторная подача операции в полёте — D17).
+  контекста до завершения запрещено (ядро пишет в его `WSAOVERLAPPED`, подача —
+  `assign()`, ADR-11; повторная подача операции в полёте отбивается
+  `WSAEALREADY` — D17, фикс 18.09.2026).
   Соединение не ведёт очередей: пользователь может держать несколько независимых
   операций одновременно (ADR-2), аллокаций нет.
 
@@ -435,41 +446,59 @@ umbrella слой не заслуживает (`etsl.net:socket`/`etsl.net:facto
 Префикс введён сразу при переезде, а не «на будущее»: импорты и так правились
 — один проход по всем файлам вместо двух.
 
-### ADR-11. Жизненный цикл IOCP-операции — `inFlight` + `C_Reactor::Assign` (13.09.2026)
+### ADR-11. Жизненный цикл IOCP-операции — `C_OperationIOCP` (13.09.2026; инкапсуляция 18.09.2026)
 
-**Решение.** Факт «операция взведена» хранится в самой операции — `bool
-inFlight` в `operation_iocp_s`. Подача любой IOCP-операции — только через
-`C_ReactorIOCP::Assign(op, post)`: шаблон по типу операции
-(`requires std::derived_from<op_t, operation_t>`) и по вызываемому
-`post(op_t&) -> etl::expected<void, int32_t>`. Порядок: `inFlight` уже стоит →
-`WSAEALREADY`; flush ровно `sizeof(WSAOVERLAPPED)`; `post(operation)`; при
-успехе `inFlight = true`. `run()` снимает флаг **до** вызова `callback` — иначе
-штатный перевзвод изнутри колбэка упирается в `WSAEALREADY`. `FlushOperation`
-из публичного API удалён (обойти flush нельзя). Выставлять флаг после
-успешного `post` корректно: цикл однопоточный (ADR-7), завершение не может быть
-доставлено до возврата из `Assign`, а на пути отказа снимать нечего.
+**Решение.** Факт «операция взведена» хранится в самой операции — приватный
+`bool inFlight_` в `C_OperationIOCP`. Операция закрыта со всех сторон: база
+`WSAOVERLAPPED` приватная (подать её в обход `assign()` нельзя), делегат
+приватный (`setDelegate()`), завершение `complete()` приватное и доступно только
+реактору (`friend class C_ReactorIOCP`).
+
+Подача — метод самой операции `assign(post)`: шаблон по вызываемому
+`post(WSAOVERLAPPED*) -> etl::expected<void, int32_t>`. Порядок: делегат не
+выставлен → `WSAEINVAL`; `inFlight_` уже стоит → `WSAEALREADY`; flush ровно
+`sizeof(WSAOVERLAPPED)`; `post(this)`; при успехе `inFlight_ = true`.
+Завершение — `complete(bytes, error)`: снимает флаг **до** вызова делегата
+(иначе штатный перевзвод изнутри колбэка упирается в `WSAEALREADY`), инвариант
+«в полёте и делегат валиден» охраняется assert'ом. `FlushOperation` из
+публичного API удалён (обойти flush нельзя). Выставлять флаг после успешного
+`post` корректно: цикл однопоточный (ADR-7), завершение не может быть доставлено
+до возврата из `assign`, а на пути отказа снимать нечего.
+
+**Почему `complete()` приватный (18.09.2026).** Счётчики ручное завершение не
+ломает: делегат вызывается, `pendingOps_` уменьшается, а повторное завершение от
+ядра гасила бы проверка флага. Ломается другое — флаг снимается, пока IRP жив у
+ядра:
+`beginTeardown` видит ноль операций, отдаёт `onDisposed`, владелец
+переиспользует или уничтожает объект, и завершение (в том числе
+`WSA_OPERATION_ABORTED` после `closesocket` — оно приходит, а не исчезает)
+адресуется освобождённой памяти. `assert(!inFlight_)` в деструкторе такой
+сценарий не ловит: флаг уже снят. Поэтому снять `inFlight_` может только реактор
+при разборе пачки, и флаг означает ровно «ядро операцию отпустило».
 
 Потребители флага: `invokeReadyRead()` не взводит вторую пробу, если
 `resumeReading()` уже взвёл её изнутри `onReadyRead`; защита от повторной
-подачи той же `send_operation_t` (D17).
+подачи той же `send_operation_t` (D17) — через публичный `inFlight()`.
 
 **Контракт `post`.** Возвращает `expected`, а не `bool`: обёртки
 `ConnectEx`/`AcceptEx` уже возвращают `expected`, `GetExtensionFunction`
 падает до подачи без `WSAGetLastError`, а `PostQueuedCompletionStatus`
-отдаёт код через `GetLastError()`. Операция передаётся в `post` параметром: подаётся ровно та
-операция, которую пометили, и лямбда видит настоящий тип (`send_operation_t&`,
-`accept_operation_t&`) без `static_cast` вниз.
+отдаёт код через `GetLastError()`. В `post` уходит `WSAOVERLAPPED*` — ровно тот
+указатель, который получит ядро; настоящий тип операции у вызывающего и так на
+руках (лямбда захватывает `send_operation_t&`/`accept_operation_t&`), `static_cast`
+вниз не нужен.
 
-**Не в `ReactorTrait`.** `Assign` — семантика completion-модели (OVERLAPPED во
-владении ядра). У epoll-реактора подачи операции нет (`epoll_ctl`, досылка по
-`EPOLLOUT`, ADR-10) — трейт требовал бы фиктивный метод; концепт к тому же не
-проверит шаблон от произвольного вызываемого. Как `TranslateError` и сам
-`operation_t` — деталь IOCP-бекенда.
+**Не в `ReactorTrait`.** Подача — семантика completion-модели (OVERLAPPED во
+владении ядра) и живёт в самой операции, а не в API реактора. У epoll-реактора
+подачи операции нет (`epoll_ctl`, досылка по `EPOLLOUT`, ADR-10) — трейт
+требовал бы фиктивный метод. Как `TranslateError` и сам `operation_t` — деталь
+IOCP-бекенда.
 
 **Замеры (13.09.2026; mingw x86_64, синтетика в scratch + Windows-ВМ):**
 
 - Размер: `WSAOVERLAPPED` 32 + `etl::delegate` 16 = 48 без хвостового
-  паддинга, поэтому `bool` стоит +8: `operation_iocp_s` 48 → 56,
+  паддинга, поэтому `bool` стоит +8: сама операция (тогда `operation_iocp_s`,
+  теперь `C_OperationIOCP`) 48 → 56,
   `send_operation_s` 72 → 80, `accept_operation_s` 344 → 352.
 - Порядок полей — **флаг последним**. Itanium ABI (GCC/clang на mingw) отдаёт
   хвостовой паддинг базы наследникам: при `transferred` (`uint32_t`) перед
@@ -510,24 +539,30 @@ inFlight` в `operation_iocp_s`. Подача любой IOCP-операции �
 - `etl::delegate` вместо шаблонного `post`: не принимает захватывающие
   лямбды, косвенный вызов не встраивается.
 
-**Инвариант и охрана.** Flush обнуляет строго `sizeof(WSAOVERLAPPED)` —
-`callback` и `inFlight` обязаны его пережить. На 14.09.2026 операция —
-открытая структура: флаг может писать кто угодно, а публичная база
-`WSAOVERLAPPED` позволяет подать операцию в обход `Assign` (флаг останется
-`false`, защита тихо не сработает). Инкапсуляция — задача 3.6.
+**Инвариант и охрана.** Flush внутри `assign()` обнуляет строго
+`sizeof(WSAOVERLAPPED)` — делегат и `inFlight_` обязаны его пережить (оба лежат
+за базой). Инкапсуляция сделана 18.09.2026 (задача 3.6): подать операцию в обход
+`assign()` нельзя — база приватная; снять флаг снаружи нельзя — `complete()`
+приватный. Обратный каст `WSAOVERLAPPED*` → `C_OperationIOCP*` в цикле остаётся
+допущением об ABI (класс не standard-layout, единственная невиртуальная база по
+смещению 0): на Itanium ABI и MSVC работает, стандартом не гарантировано.
 
-**Фактическое состояние кода (14.09.2026).** `Assign` — статический метод
-`C_ReactorIOCP` (шаблон в интерфейсе `:iocp`), все места подачи connection и
-acceptor (`ConnectEx`, read-проба, `WSASend`, `AcceptEx`) идут через него.
-Флаг в `operation_iocp_s` уже стоит последним; `transferred` в
-`send_operation_s` по-прежнему после `content` — структура 80 байт, а не 72.
-`post(operation_t&)` (алиас `task_t` удалён, `ReactorTrait` принимает
-`operation_t&`) идёт **мимо** `Assign`: флаг не ставит (снятие в `run()`
-безвредно), повторный `post` того же таска, пока он в очереди, не ловится.
+**Фактическое состояние кода (18.09.2026).** `assign()`/`complete()` — методы
+`C_OperationIOCP` в `:iocp_defs`; все места подачи connection и acceptor
+(`ConnectEx`, read-проба, `WSASend`, `AcceptEx`) идут через `assign()`. Флаг
+стоит последним, `transferred` в `send_operation_s` — перед `content`,
+структура **72 байта** (замер 18.09.2026: `transferred` ложится в хвостовой
+паддинг базы, смещение 52); `static_assert(sizeof(send_operation_s) == 72)` ещё
+не поставлен — см. 3.7. `post(operation_t&)` (алиас `task_t` удалён,
+`ReactorTrait` принимает `operation_t&`) теперь тоже идёт через `assign()`:
+повторный `post` того же таска, пока он в очереди, отбивается `WSAEALREADY`.
+Цикл разбирает completion пачкой (`GetQueuedCompletionStatusEx`, до 32 записей
+за вызов, запись-будильник от `shutdown()` с `lpOverlapped == nullptr`
+пропускается); `run()` и `shutdown()` возвращают `etl::expected<void, int32_t>`.
 
 ---
 
-## 4. Структура модулей (фактическая после 2.7, обновлено 11.09.2026)
+## 4. Структура модулей (фактическая после 2.7, обновлено 18.09.2026)
 
 ```
 src/
@@ -554,7 +589,7 @@ src/
 │   │   ├── tcp_connection.cppm                 # etsl.tcp.connection — alias C_TCPConnection<T>
 │   │   ├── tcp_connection_defs.cppm            # send_operation_t
 │   │   ├── tcp_connection_delegate_trait.cppm  # concept TCPConnectionDelegate
-│   │   └── iocp/                     # C_TCPConnectionIOCP + defs_iocp
+│   │   └── iocp/                     # C_TCPConnectionIOCP + :defs_iocp
 │   └── acceptor/
 │       ├── tcp_acceptor.cppm                   # etsl.tcp.acceptor — alias C_TCPAcceptor
 │       ├── tcp_acceptor_delegate_trait.cppm    # concept TCPAcceptorDelegate
@@ -564,11 +599,13 @@ src/
 │   ├── reactor.cppm                  # etsl.reactor — alias C_Reactor
 │   ├── reactor_trait.cppm            # concept ReactorTrait: initialize/run/
 │   │                                 # shutdown/associate/detach/post/
-│   │                                 # addTimer/removeTimer
-│   └── iocp/                         # reactor_iocp*; epoll/ — Этап 4
-├── timer/                            # etsl.timer, etsl.timer:types,
-│                                     # etsl.timer.bucket — пользовательские
-│                                     # таймеры реактора (ADR-2)
+│   │                                 # schedule/unschedule
+│   └── iocp/                         # reactor_iocp* (C_ReactorIOCP,
+│                                     # C_OperationIOCP); epoll/ — Этап 4
+├── timer/                            # etsl.timer: export import :defs :impl
+│                                     # :queue — C_Timer (колбэк void(C_Timer&)),
+│                                     # C_TimerQueue; пользовательские таймеры
+│                                     # реактора (ADR-2)
 └── util/                             # noncopyable.h, etl_chrono.cpp
 
 test/tcp_connection_iocp_test.cpp  # gtest-набор connection + acceptor (49 тестов)
@@ -579,7 +616,11 @@ review/next-steps.md               # план фиксов и размышлен
 ```
 
 Соглашения: имя файла модуля == имя модуля; `export module <domain>[.<sub>]`;
-namespace `etsl`; классы с префиксом `C_`, методы `snake_case`. Ос-шины свободных
+namespace `etsl`; классы с префиксом `C_`, структуры-агрегаты (контексты без
+инварианта: `send_operation_s`, `accept_operation_s`, `dispose_operation_iocp_s`)
+— с суффиксом `_s`, методы `snake_case`. Соседство `C_OperationIOCP` и
+`send_operation_s` — это и есть правило («у типа появился инвариант → он
+`C_`-класс»), а не хвост незавершённого переименования. Ос-шины свободных
 функций (`etsl.init`, `etsl.net:ops`/`:factory`, 28.08.2026) оформлены паттерном
 «контракт + impl-юнит»: `.cppm` — только декларации (ноль ifdef в телах), тела —
 в `<feature>/<os>/*.cpp` (`module <mod>;`), файл выбирает CMake по платформе
@@ -627,7 +668,7 @@ dependency, но формально ill-formed NDR).
 
 ---
 
-## 5. Известные дефекты (обновлено 14.09.2026)
+## 5. Известные дефекты (обновлено 18.09.2026)
 
 D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оставлены как история.
 Подробности D12–D16 — `review/result.md`; план работ и размышления —
@@ -700,12 +741,13 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   она ломает инстанцирование у потребителя (см. §4, правило партиций).
   Внутренности наружу нигде не уехали: в `:iocp_defs`/`:defs_iocp` сущности
   объявлены в обычном `namespace etsl` без `export` (состояния, константы,
-  `operation_iocp_s`). Единственное исключение — `accept_operation_s`,
+  сама IOCP-операция). Единственное исключение — `accept_operation_s`,
   помеченный `export` сознательно: пользователь обязан завести под него
-  `etl::pool`. *Состояние на 14.09.2026 (запись выше про `operation_iocp_s`
-  устарела):* в `etsl.reactor:iocp_defs` с `export` теперь объявлены
-  `operation_iocp_s` и `dispose_operation_iocp_s` (в HEAD `9b36efa` — без);
-  `iocp_code_e` не экспортируется. `etsl.tcp.connection:defs_iocp`
+  `etl::pool`. *Состояние на 18.09.2026 (записи выше про `operation_iocp_s`
+  устарели):* в `etsl.reactor:iocp_defs` с `export` объявлены `C_OperationIOCP`
+  (бывш. `operation_iocp_s`) и `dispose_operation_iocp_s` — их видит
+  пользователь, потому что владеет операциями; `iocp_code_e` удалён вместе с
+  зарезервированными completion key. `etsl.tcp.connection:defs_iocp`
   (состояния, `EXPLICIT_DISPOSE`/`INVALID_CACHE_VALUE`) — без `export`;
   `etsl.tcp.acceptor:defs_iocp` — по-прежнему только `accept_operation_s`.
 
@@ -736,8 +778,10 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   etl::unexpected(WSAEALREADY);` в `send()` до любых записей и без teardown —
   usage-отказ наравне с `WSAEINVAL`/`WSAENOTCONN` (ADR-2). Перевзвод частичной
   отправки (`onSendOperation` → `createSendOperation`) эти поля не пишет — не
-  задет. Нужен тест: повторный `send()` той же операции → `WSAEALREADY`,
-  соединение живо, `onCommit` первой подачи корректен.
+  задет. *Фикс сделан 18.09.2026* — проверка `operation.inFlight()` в начале
+  `send()`, до записи полей и без teardown. Тест по-прежнему нужен: повторный
+  `send()` той же операции → `WSAEALREADY`, соединение живо, `onCommit` первой
+  подачи корректен (см. 3.7).
 
 - **D18** *(закрыт 14.09.2026 в тот же день; найден при фиксации 3.3, тестом
   не воспроизводился)*: `resumeReading()` (`tcp_connection_iocp.cppm:233–249`)
@@ -756,11 +800,11 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
   возвращают `WSAEISCONN`, в остальном API для этого случая — `WSAENOTCONN`.
   **Фикс (14.09.2026):** `resumeReading()` снимает `suspendReading_` до
   взвода; `WSAEALREADY` из `createReadProbeOperation()` (проба уже в полёте,
-  отказ `Assign`) — успех, её завершение перевзведётся через `invokeReadyRead`;
+  отказ подачи) — успех, её завершение перевзведётся через `invokeReadyRead`;
   прочие отказы → `beginTeardown` + информационный sync-код; вне `CONNECTED` —
   `WSAENOTCONN`. Различение идёт по коду: `WSARecv` `WSAEALREADY` по
   документации не возвращает, так что сейчас это однозначно — явная проверка
-  `readinessOperation_.inFlight` сделала бы связь самодокументируемой. Прогон
+  `readinessOperation_.inFlight()` сделала бы связь самодокументируемой. Прогон
   44/44 (Debug, MinGW, ВМ); тестов на пути паузы по-прежнему нет (3.3).
 
 - **D1.** `#if defined(WINNT)` — `WINNT` определяет **только MinGW**-тулчейн
@@ -784,8 +828,9 @@ D1–D8 (проверено 2026-07-18) закрыты в Этапе 0; оста
 - **D5.** `src/reactor/impl/event_loop_iocp.cpp:33-35`: все failed completions
   молча выбрасываются — ошибки (`WSAECONNRESET` и т.п.) не доходят до
   обработчика. Извлекать код через `WSAGetOverlappedResult`.
-- **D6.** `halt_` — обычный `bool`; `shutdown()` из другого потока = data race.
-  Сделать атомарным (Interlocked* / `etl::atomic`).
+- **D6** *(закрыт 18.09.2026)*: `halt_` — обычный `bool`; `shutdown()` из
+  другого потока = data race. Сделан `etl::atomic<bool>`:
+  `load(memory_order_acquire)` в `run()`, `store(..., release)` в `shutdown()`.
 - **D7.** `C_ISocket` — мёртвый код (конструктор объявлен, но нигде не определён;
   класс абстрактный). Удалить вместе с `C_EventNode`, если к Этапу 1 не найдётся
   применения.
@@ -1146,25 +1191,37 @@ baseline размера зафиксирован.
       `WSAEHOSTUNREACH`.
 - [ ] **3.5** DNS: решение — v1: блокирующий `getaddrinfo` до вызова connect;
       позже `GetAddrInfoEx` overlapped. Зафиксировать выбор здесь.
-- [ ] **3.6** *(добавлено 14.09.2026)* Операция IOCP — тип с инвариантом
-      (ADR-11). `operation_iocp_s` перерос «просто структуру»: у него есть
-      состояние и порядок переходов, которые сейчас никто не охраняет.
-      Целевой вид: приватная база `WSAOVERLAPPED` (подача в обход `Assign` —
-      ошибка компиляции); `inFlight_` приватный + `inFlight() const`;
-      приватные `flush()` и `complete(bytes, error)` (снять флаг → колбэк —
-      порядок живёт в одном месте); `friend class C_ReactorIOCP`
-      (предварительное объявление в `:iocp_defs`; дружба между партициями
-      одного модуля с clang-модулями не проверена). `Assign` отдаёт в `post`
-      операцию и `WSAOVERLAPPED&` — единственный источник указателя для
-      `ConnectEx`/`AcceptEx`/`WSARecv`/`WSASend`; в `run()` — `static_cast` +
-      `complete()` вместо `reinterpret_cast`; `post(task)` — через `Assign`.
-      Раскладка: флаг последним — **сделано** (14.09.2026); осталось
-      `transferred` перед `content` (сейчас `send_operation_s` 80 байт) и
-      `static_assert(sizeof(send_operation_s) == 72)`. `callback` пока
-      публичный (выставляют владельцы). Решить: суффикс `_s` при приватных
-      членах (соглашение §4: классы — `C_`) — переименование задевает
-      публичный `send_operation_s`. В той же задаче — фикс D17 и тесты
-      повторной подачи.
+- [x] **3.6** *(добавлено 14.09.2026, сделано 18.09.2026)* Операция IOCP — тип
+      с инвариантом (ADR-11). Сделано: приватная база `WSAOVERLAPPED` (подача в
+      обход `assign()` — ошибка компиляции), приватные `delegate_`/`inFlight_`
+      (наружу `setDelegate()` и `inFlight() const`), приватный
+      `complete(bytes, error)` (снять флаг → делегат, порядок живёт в одном
+      месте) + `friend class C_ReactorIOCP`; flush спрятан в `assign()`; в
+      `run()` — `complete()` вместо ручной возни с флагом; `post(task)` тоже
+      через `assign()`. Дружба между партициями одного модуля с clang-модулями
+      работает, предварительное объявление не понадобилось. Раскладка: флаг
+      последним (14.09.2026) и `transferred` перед `content` —
+      `send_operation_s` 72 байта (замер 18.09.2026). Фикс D17 — там же.
+      Отличия от плана: `assign()` — метод операции, а не `Assign` у реактора,
+      и в `post` уходит `WSAOVERLAPPED*`, а не пара «операция + OVERLAPPED&».
+      Остатки — в 3.7.
+- [ ] **3.7** *(добавлено 18.09.2026)* Хвосты после переноса цикла на
+      `GetQueuedCompletionStatusEx` и инкапсуляции операции:
+      - тест на D17 (повторная подача операции в полёте) — единственная
+        непокрытая новая ветка;
+      - `static_assert(sizeof(send_operation_s) == 72)`: размер держится на
+        переиспользовании хвостового паддинга базы (Itanium ABI), под MSVC
+        будет 80 — assert как сторож раскладки, а не как требование;
+      - размер пачки: `32` зашит литералом в двух местах (объявление `entries`
+        и `std::size`) → `constexpr`; решение о числе — после замера;
+      - замер: гистограмма `fetched` на эхо-паре 8×64 МиБ + дельта размера по
+        ADR-9; без цифр перенос оправдан только симметрией формы цикла с
+        `epoll_wait` (разбор — `review/gqcsex-and-timer-callback.md`,
+        проверка переноса — `review/gqcsex-port.md`);
+      - ADR «Порядок в итерации»: пачка completion → таймеры от одного `now()`
+        → disposables; гранулярность таймеров — пачка, а не отдельное
+        completion; отложенная финализация teardown (`disposable_`) — условие
+        безопасности батча, а не деталь реализации.
 
 **DoD:** тесты на timeout/RST/backpressure/graceful close зелёные.
 
@@ -1209,7 +1266,7 @@ baseline размера зафиксирован.
 5. Read-probe — ровно один pending OVERLAPPED на сокет; send-операций может
    быть несколько, каждая со своим caller-owned OVERLAPPED (ADR-2/ADR-4);
    лайфтайм по ADR-5. Подача любой IOCP-операции — только через
-   `C_Reactor::Assign` (ADR-11).
+   `C_OperationIOCP::assign(post)` (ADR-11).
 6. Каждый новый модуль — в `FILE_SET CXX_MODULES` в `CMakeLists.txt`; имя файла
    == имя модуля. Публичный — префикс `etsl.` и строка в `src/etsl.cppm`;
    внутренние модули и партиции — без префикса.

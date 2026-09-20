@@ -7,7 +7,8 @@ module;
 #include <ntdef.h>
 
 #include <etl/chrono.h>
-#include "etl/expected.h"
+#include <etl/expected.h>
+#include <etl/span.h>
 
 module etsl.reactor;
 
@@ -17,14 +18,14 @@ namespace etsl
 {
     C_ReactorIOCP::~C_ReactorIOCP() noexcept
     {
-        if (this->iocp_ != nullptr) {
+        if (this->iocp_) {
             CloseHandle(this->iocp_);
         }
     }
 
     etl::expected<void, int32_t> C_ReactorIOCP::initialize() noexcept
     {
-        if (this->iocp_ != nullptr) {
+        if (this->iocp_) {
             return {};
         }
 
@@ -52,15 +53,13 @@ namespace etsl
 
     etl::expected<void, int32_t> C_ReactorIOCP::post(operation_t& task) noexcept
     {
-        if (const auto err = Assign(task,
-            [this](operation_t& operation) noexcept -> etl::expected<void, int32_t> {
-                if (!PostQueuedCompletionStatus(this->iocp_, 0, 0, &operation)) {
-                    return etl::unexpected(static_cast<int32_t>(GetLastError()));
-                }
-
-                return {};
+        if (const auto err = task.assign([this](WSAOVERLAPPED* operation) noexcept -> etl::expected<void, int32_t> {
+            if (!PostQueuedCompletionStatus(this->iocp_, 0, 0, operation)) {
+                return etl::unexpected(static_cast<int32_t>(GetLastError()));
             }
-        ); !err) {
+
+            return {};
+        }); !err) {
             return err;
         }
 
@@ -77,25 +76,11 @@ namespace etsl
         this->timerQueue_.unschedule(timer);
     }
 
-    void C_ReactorIOCP::run() noexcept
+    etl::expected<void, int32_t> C_ReactorIOCP::run() noexcept
     {
-        while (this->halt_ == false) {
-            DWORD bytesTransferred = 0;
-            ULONG_PTR completionKey = 0;
-            WSAOVERLAPPED* overlapped = nullptr;
-
-            const auto ioStatus = GetQueuedCompletionStatus(this->iocp_, &bytesTransferred, &completionKey, &overlapped, nextTimeout());
-            auto ioError = (ioStatus) ? 0 : static_cast<int32_t>(GetLastError());
-
-            if (overlapped) {
-                const auto operation = reinterpret_cast<operation_t*>(overlapped);
-                if (completionKey && !NT_SUCCESS(operation->Internal)) {
-                    ioError = TranslateError(completionKey, operation);
-                }
-
-                operation->inFlight = false;
-                operation->callback(*operation, bytesTransferred, ioError);
-            }
+        etl::expected<void, int32_t> err;
+        while (!this->halt_.load(std::memory_order_acquire) && err) {
+            err = ProceedOperations(this->iocp_, nextTimeout());
 
             const auto currentTime = steady_clock_t::now();
             while (const auto timer = this->timerQueue_.pop(currentTime)) {
@@ -103,15 +88,21 @@ namespace etsl
             }
 
             while (const auto disposable = popDisposable()) {
-                disposable->callback();
+                disposable->delegate();
             }
         }
+
+        return err;
     }
 
-    void C_ReactorIOCP::shutdown() noexcept
+    etl::expected<void, int32_t> C_ReactorIOCP::shutdown() noexcept
     {
-        this->halt_ = true;
-        PostQueuedCompletionStatus(this->iocp_, 0, 0, nullptr);
+        this->halt_.store(true, std::memory_order_release);
+        if (!PostQueuedCompletionStatus(this->iocp_, 0, 0, nullptr)) {
+            return etl::unexpected(static_cast<int32_t>(GetLastError()));
+        }
+
+        return {};
     }
 
     int32_t C_ReactorIOCP::TranslateError(const socket_t fd, WSAOVERLAPPED* operation) noexcept
@@ -167,5 +158,30 @@ namespace etsl
         this->disposable_.pop_front();
 
         return ptr;
+    }
+
+    etl::expected<void, int32_t> C_ReactorIOCP::ProceedOperations(HANDLE iocp, uint32_t timeout) noexcept
+    {
+        OVERLAPPED_ENTRY entries[32]; ULONG fetched = 0;
+
+        if (const bool status = GetQueuedCompletionStatusEx(iocp, entries, std::size(entries), &fetched, timeout, false); !status) {
+            const auto err = GetLastError();
+            return (err == WAIT_TIMEOUT) ? etl::expected<void, int32_t>() : etl::unexpected(static_cast<int32_t>(err));
+        }
+
+        for (const auto& entry : etl::span{entries, fetched}) {
+            if (!entry.lpOverlapped) {
+                continue;
+            }
+
+            int32_t ioError = ERROR_SUCCESS;
+            if (entry.lpCompletionKey && !NT_SUCCESS(entry.lpOverlapped->Internal)) {
+                ioError = TranslateError(entry.lpCompletionKey, entry.lpOverlapped);
+            }
+
+            static_cast<void>(reinterpret_cast<operation_t*>(entry.lpOverlapped)->complete(entry.dwNumberOfBytesTransferred, ioError));
+        }
+
+        return {};
     }
 }
